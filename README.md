@@ -8,6 +8,7 @@ A two-line status bar for Claude Code, drawn under the prompt:
 ```
 
 - Model and effort: click either (or focus the band with ctrl+x tab, then `m` / `e`) to open the `/model` or `/effort` picker.
+- Inside a Slurm allocation, the job and its GPUs at the end of line 1: `job 4242 · 2×gpu[0,1]`, read from `SLURM_JOB_ID` and the GPU variables (never `squeue`), so redraws put no load on the scheduler.
 - Context fill, session cost, and session time.
 - 5-hour and 7-day usage, each with a pace arrow: `⇣15%` (green) means 15% under the even pace for the window, `⇡15%` (red) means burning 15% faster than it allows. The arrow is held back until 15 minutes (5h) or 6 hours (7d) of the window have passed.
 

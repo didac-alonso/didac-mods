@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Limit, Snapshot } from '../types'
-import { PLAIN, line1, line2 } from './format'
+import { PLAIN, line1, line2, slurmFrom } from './format'
 import type { Seg } from './format'
 
 const EMPTY: Snapshot = {
@@ -14,6 +14,7 @@ const EMPTY: Snapshot = {
   costUsd: null,
   startedAt: null,
   limits: [],
+  slurm: null,
 }
 
 const snapshot = atom({ plugin: 'pace-line', key: 'snapshot' } as const, EMPTY)
@@ -73,11 +74,20 @@ export const register: Register = on => {
     // it to Bash; then the saved one. A turn's request corrects either.
     const prior = (await read($, snapshot)).effort
     const env = await $.env.get('CLAUDE_EFFORT')
+    // Set once when the job starts; Claude Code inherits it from the shell.
+    const slurm = slurmFrom({
+      SLURM_JOB_ID: await $.env.get('SLURM_JOB_ID'),
+      SLURM_JOB_GPUS: await $.env.get('SLURM_JOB_GPUS'),
+      SLURM_STEP_GPUS: await $.env.get('SLURM_STEP_GPUS'),
+      CUDA_VISIBLE_DEVICES: await $.env.get('CUDA_VISIBLE_DEVICES'),
+      SLURM_GPUS_ON_NODE: await $.env.get('SLURM_GPUS_ON_NODE'),
+    })
     const effort = prior ?? (env && LEVELS.includes(env) ? env : await effortFromSettings($, model))
     await update($, snapshot, s => ({
       ...s,
       model,
       effort,
+      slurm,
       contextPercent: usage.context.percent ?? null,
       costUsd: usage.cost?.usd ?? null,
       startedAt: usage.startedAt,

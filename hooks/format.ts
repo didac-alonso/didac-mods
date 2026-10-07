@@ -1,7 +1,7 @@
 // Pure layout for the band: a port of ~/.claude/statusline-command.sh.
 // Each line is a list of coloured segments; register.tsx turns them into Text.
 
-import type { Limit, Snapshot } from '../types'
+import type { Limit, Slurm, Snapshot } from '../types'
 
 /** `action` marks a segment drawn as a button that opens that picker. */
 export type Seg = { text: string; color?: string; action?: 'model' | 'effort' }
@@ -16,6 +16,7 @@ const YELLOW = '#f0c674' // \033[33m, palette 3
 const ORANGE = '#ff8700' // \033[38;5;208m
 const RED = '#cc6666' // \033[31m, palette 1
 const GRAY = '#666666' // \033[90m, palette 8
+const MAGENTA = '#b294bb' // \033[35m, palette 5
 // Text the script leaves uncoloured: Claude Code draws a status line's
 // default-coloured text in this gray, so the band does too.
 export const PLAIN = '#999999'
@@ -121,7 +122,37 @@ function join(groups: Seg[][], sep: Seg): Seg[] {
   return out
 }
 
-/** [Model · effort] · folder | branch */
+/**
+ * The allocation from Slurm's environment, as the explorer script reads it:
+ * never squeue or scontrol, so a redraw puts no load on the controller.
+ * The GPU ids come from whichever is set first, which depends on how the GPUs
+ * were asked for (--gres or --gpus) and on job versus step.
+ */
+export function slurmFrom(env: {
+  SLURM_JOB_ID?: string
+  SLURM_JOB_GPUS?: string
+  SLURM_STEP_GPUS?: string
+  CUDA_VISIBLE_DEVICES?: string
+  SLURM_GPUS_ON_NODE?: string
+}): Slurm | null {
+  if (!env.SLURM_JOB_ID) return null
+  const gpus = env.SLURM_JOB_GPUS || env.SLURM_STEP_GPUS || env.CUDA_VISIBLE_DEVICES || null
+  return { job: env.SLURM_JOB_ID, gpus, gpusOnNode: env.SLURM_GPUS_ON_NODE || null }
+}
+
+/** job 123456 · 2×gpu[0,1], or 2×gpu when only the count is known. */
+function slurmSegs(slurm: Slurm): Seg[] {
+  const segs: Seg[] = [{ text: `job ${slurm.job}`, color: MAGENTA }]
+  if (slurm.gpus) {
+    const count = slurm.gpus.split(',').length
+    segs.push({ text: ' · ' }, { text: `${count}×gpu[${slurm.gpus}]`, color: GRAY })
+  } else if (slurm.gpusOnNode) {
+    segs.push({ text: ' · ' }, { text: `${slurm.gpusOnNode}×gpu`, color: GRAY })
+  }
+  return segs
+}
+
+/** [Model · effort] · folder | branch | job 123456 · 2×gpu[0,1] */
 export function line1(s: Snapshot): Seg[] {
   const model: Seg[] = []
   if (s.model) {
@@ -132,7 +163,7 @@ export function line1(s: Snapshot): Seg[] {
     model.push({ text: ']', color: CYAN })
   }
   const head = join([model, s.folder ? [{ text: s.folder }] : []], { text: ' · ' })
-  return join([head, s.branch ? [{ text: s.branch }] : []], SEP)
+  return join([head, s.branch ? [{ text: s.branch }] : [], s.slurm ? slurmSegs(s.slurm) : []], SEP)
 }
 
 /** context bar · pct% | $cost | ⏱ time | 5h bar | 7d bar */

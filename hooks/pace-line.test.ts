@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import type { Snapshot } from '../types'
-import { bar, fmtDur, line1, line2, modelLabel, paceDelta } from './format'
+import { bar, fmtDur, line1, line2, modelLabel, paceDelta, slurmFrom } from './format'
 
 const NOW = Date.parse('2026-10-07T15:00:00Z')
 const iso = (msFromNow: number) => new Date(NOW + msFromNow).toISOString()
@@ -21,6 +21,7 @@ const SNAP: Snapshot = {
     // 7d window, 1 day left (6 of 7 in), 90% used: expected 85.7% → ⇡5%.
     { kind: 'seven_day', percentUsed: 90, resetsAt: iso(86400_000) },
   ],
+  slurm: null,
 }
 
 describe('format', () => {
@@ -55,6 +56,27 @@ describe('format', () => {
   test('line 1', () => {
     expect(text(line1(SNAP))).toBe('[Opus 5.5 · high] · didac | main')
     expect(text(line1({ ...SNAP, effort: null, branch: null }))).toBe('[Opus 5.5] · didac')
+  })
+
+  test('slurm: nothing outside a job', () => {
+    expect(slurmFrom({})).toBe(null)
+    expect(slurmFrom({ CUDA_VISIBLE_DEVICES: '0' })).toBe(null)
+  })
+
+  test('slurm: GPU ids from the first variable set, as the explorer script', () => {
+    expect(slurmFrom({ SLURM_JOB_ID: '7', SLURM_JOB_GPUS: '2,3', SLURM_STEP_GPUS: '0', CUDA_VISIBLE_DEVICES: '0' })?.gpus).toBe('2,3')
+    expect(slurmFrom({ SLURM_JOB_ID: '7', SLURM_STEP_GPUS: '1', CUDA_VISIBLE_DEVICES: '0' })?.gpus).toBe('1')
+    expect(slurmFrom({ SLURM_JOB_ID: '7', CUDA_VISIBLE_DEVICES: '0,1' })?.gpus).toBe('0,1')
+  })
+
+  test('line 1 with a job: ids, count only, or no GPUs', () => {
+    const job = (slurm: Snapshot['slurm']) => text(line1({ ...SNAP, slurm }))
+    expect(job({ job: '4242', gpus: '0,1', gpusOnNode: '2' })).toBe('[Opus 5.5 · high] · didac | main | job 4242 · 2×gpu[0,1]')
+    expect(job({ job: '4242', gpus: null, gpusOnNode: '4' })).toBe('[Opus 5.5 · high] · didac | main | job 4242 · 4×gpu')
+    expect(job({ job: '4242', gpus: null, gpusOnNode: null })).toBe('[Opus 5.5 · high] · didac | main | job 4242')
+    const segs = line1({ ...SNAP, slurm: { job: '4242', gpus: '0', gpusOnNode: null } })
+    expect(segs.find(s => s.text === 'job 4242')?.color).toBe('#b294bb')
+    expect(segs.find(s => s.text === '1×gpu[0]')?.color).toBe('#666666')
   })
 
   test('line 2 with both windows: narrow bars, 7d countdown dropped', () => {
@@ -126,4 +148,28 @@ test('the band draws both lines once the session starts', async ($, on) => {
     await ui.pointer({ type: 'up', x: 0, y: 0, button: 'left', in: 'line1' })
   }
   expect(ran).toEqual(['model', 'effort', 'model', 'effort'])
+})
+
+test('inside a Slurm job the band shows it from the environment', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.cwd', () => ({ value: '/home/alonsolopez.d/project' }))
+  on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 1_000_000 }, rateLimits: [] } }))
+  on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('settings.read', () => ({ value: {} }))
+  const env: Record<string, string> = { SLURM_JOB_ID: '4242', SLURM_JOB_GPUS: '0,1', CLAUDE_EFFORT: 'high' }
+  on('env.get', (_$, e) => ({ value: env[e.name] }))
+  on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: '' }))
+
+  await $.session.start({ cwd: '/home/alonsolopez.d/project', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: 'pace-line',
+    surface: 'terminal',
+    component: 'PromptHint',
+    props: { isDraft: false, isWorking: false, hint: '' },
+  })
+  expect((await ui.find({ type: 'Text', text: 'job 4242', in: 'line1' }))?.props).toEqual(expect.objectContaining({ color: '#b294bb' }))
+  expect((await ui.find({ type: 'Text', text: '2×gpu[0,1]', in: 'line1' }))?.props).toEqual(expect.objectContaining({ color: '#666666' }))
+  expect(await ui.find({ type: 'Text', text: 'high', in: 'line1' })).toBeDefined()
 })
