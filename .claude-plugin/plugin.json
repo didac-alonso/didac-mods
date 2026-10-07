@@ -1,6 +1,6 @@
 {
   "name": "pace-line",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Two-line coloured usage band above the prompt: model, folder, branch, context, cost, time, and 5h/7d limits with pace arrows.",
   "types": "./types/index.d.ts",
   "author": {
