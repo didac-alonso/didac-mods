@@ -192,6 +192,12 @@ describe('alerts', () => {
     expect(near.text).toContain('last checkpoint 1h30m ago')
   })
 
+  test('near the limit: a short job is only near it in its last quarter', () => {
+    const short = (elapsedS: number) => kinds(job({ limitS: 480, elapsedS, startedAt: NOW - elapsedS * 1000 }))
+    expect(short(45)).not.toContain('nearLimit')
+    expect(short(370)).toContain('nearLimit')
+  })
+
   test('pending past the threshold, with its reason', () => {
     const a = alertsFor(job({ state: 'PENDING', reason: 'Priority', submittedAt: NOW - 3 * 3600_000, startedAt: null }), NOW, th)
     expect(a.map(x => x.kind)).toEqual(['pending'])

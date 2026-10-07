@@ -68,7 +68,8 @@ export function alertsFor(job: BatchJob, now: number, th: Thresholds): Alert[] {
     const ckptAge = job.ckpt ? ageMin(now, job.ckpt.mtimeMs) : null
     if (job.limitS !== null && job.elapsedS !== null) {
       const left = job.limitS - job.elapsedS
-      if (left <= th.nearLimitMinutes * 60) {
+      // A quarter of the limit at most: an 8-minute job isn't "near" its end at start.
+      if (left <= Math.min(th.nearLimitMinutes * 60, job.limitS / 4)) {
         const ck = job.ckpt
           ? `last checkpoint ${fmtDur((ckptAge ?? 0) * 60)} ago`
           : 'no checkpoint found'
