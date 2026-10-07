@@ -1,21 +1,21 @@
 // Surface module for line 1: draws the segments in their own colours at rest
 // (a Button can't be coloured until hovered) and turns a click on the model
-// or effort into a post the hooks module answers by opening that picker.
+// or effort into a post the hooks module answers by opening that picker, and
+// a click on the Slurm job into one that opens the job panel.
 
 import type { ClientModule } from 'claude-code'
 
+import { cellWidth } from './format'
 import type { Seg } from './format'
 
 type Props = { segs: Seg[]; plain: string }
 type State = { hovered: number | null }
 
-const width = (text: string) => [...text].length
-
 // Which segment the column falls in, by the cells each one takes.
 function segAt(segs: Seg[], x: number): number | null {
   let left = 0
   for (let i = 0; i < segs.length; i++) {
-    const right = left + width(segs[i]!.text)
+    const right = left + cellWidth(segs[i]!.text)
     if (x >= left && x < right) return i
     left = right
   }
@@ -39,10 +39,12 @@ const Line1: ClientModule<Props, State> = (props, surface) => {
     if (next !== hovered) surface.setState({ hovered: next })
   })
 
-  // While the band has the focus (ctrl+x tab): m or Enter for the model, e for effort.
+  // While the band has the focus (ctrl+x tab): m or Enter for the model, e for
+  // effort, j for the Slurm job panel.
   surface.onKey(e => {
     if (e.key === 'm' || e.key === 'return') surface.post({ open: 'model' })
     if (e.key === 'e') surface.post({ open: 'effort' })
+    if (e.key === 'j' && segs.some(seg => seg.action === 'job')) surface.post({ open: 'job' })
   })
 
   return (

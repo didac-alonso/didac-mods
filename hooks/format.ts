@@ -4,7 +4,7 @@
 import type { Limit, Slurm, Snapshot } from '../types'
 
 /** `action` marks a segment drawn as a button that opens that picker. */
-export type Seg = { text: string; color?: string; action?: 'model' | 'effort' }
+export type Seg = { text: string; color?: string; action?: 'model' | 'effort' | 'job' }
 
 // The script's ANSI colours as Ghostty's palette draws them (its defaults:
 // no theme or palette is set). A mod can't emit palette codes: names and
@@ -17,6 +17,13 @@ const ORANGE = '#ff8700' // \033[38;5;208m
 const RED = '#cc6666' // \033[31m, palette 1
 const GRAY = '#666666' // \033[90m, palette 8
 const MAGENTA = '#b294bb' // \033[35m, palette 5
+/** The palette, for the job panel. */
+export const COLORS = { CYAN, GREEN, YELLOW, ORANGE, RED, GRAY, MAGENTA } as const
+
+// Under this much time left the countdown turns red; at WARN_SECONDS a toast warns.
+export const URGENT_SECONDS = 15 * 60
+export const WARN_SECONDS = 10 * 60
+
 // Text the script leaves uncoloured: Claude Code draws a status line's
 // default-coloured text in this gray, so the band does too.
 export const PLAIN = '#999999'
@@ -28,6 +35,16 @@ const SEP: Seg = { text: ' | ' }
 const WINDOWS: Record<string, { label: string; length: number; minElapsed: number }> = {
   five_hour: { label: '5h', length: 18000, minElapsed: 900 },
   seven_day: { label: '7d', length: 604800, minElapsed: 21600 },
+}
+
+/**
+ * Terminal cells a text takes: emoji-presentation symbols such as ⌛ take two.
+ * Line 1's clickable region is sized and hit-tested with this.
+ */
+export function cellWidth(text: string): number {
+  let n = 0
+  for (const ch of text) n += /\p{Emoji_Presentation}/u.test(ch) ? 2 : 1
+  return n
 }
 
 /** 3d22h / 2h5m / 48m / 44s */
@@ -66,7 +83,7 @@ export function bar(percent: number, width: number): string {
   return '█'.repeat(filled) + '▒'.repeat(width - filled)
 }
 
-function usageColor(percent: number): string {
+export function usageColor(percent: number): string {
   const p = Math.round(percent)
   if (p >= 90) return RED
   if (p >= 65) return ORANGE
@@ -134,26 +151,46 @@ export function slurmFrom(env: {
   SLURM_STEP_GPUS?: string
   CUDA_VISIBLE_DEVICES?: string
   SLURM_GPUS_ON_NODE?: string
+  SLURM_JOB_END_TIME?: string
 }): Slurm | null {
   if (!env.SLURM_JOB_ID) return null
   const gpus = env.SLURM_JOB_GPUS || env.SLURM_STEP_GPUS || env.CUDA_VISIBLE_DEVICES || null
-  return { job: env.SLURM_JOB_ID, gpus, gpusOnNode: env.SLURM_GPUS_ON_NODE || null }
+  // Epoch seconds, set by Slurm 23.02+ when the job starts.
+  const end = Number(env.SLURM_JOB_END_TIME)
+  return {
+    job: env.SLURM_JOB_ID,
+    gpus,
+    gpusOnNode: env.SLURM_GPUS_ON_NODE || null,
+    endsAt: end > 0 ? end * 1000 : null,
+  }
 }
 
-/** job 123456 · 2×gpu[0,1], or 2×gpu when only the count is known. */
-function slurmSegs(slurm: Slurm): Seg[] {
-  const segs: Seg[] = [{ text: `job ${slurm.job}`, color: MAGENTA }]
+/** Seconds until the job's end; null when unknown. */
+export function jobLeft(slurm: Slurm, nowMs: number): number | null {
+  return slurm.endsAt === null ? null : Math.max(0, Math.floor((slurm.endsAt - nowMs) / 1000))
+}
+
+/** job 123456 · 2×gpu[0,1] · ⌛ 1h12m; the job opens the panel. */
+function slurmSegs(slurm: Slurm, nowMs: number): Seg[] {
+  const segs: Seg[] = [{ text: `job ${slurm.job}`, color: MAGENTA, action: 'job' }]
   if (slurm.gpus) {
     const count = slurm.gpus.split(',').length
     segs.push({ text: ' · ' }, { text: `${count}×gpu[${slurm.gpus}]`, color: GRAY })
   } else if (slurm.gpusOnNode) {
     segs.push({ text: ' · ' }, { text: `${slurm.gpusOnNode}×gpu`, color: GRAY })
   }
+  const left = jobLeft(slurm, nowMs)
+  if (left !== null) {
+    segs.push({ text: ' · ' }, {
+      text: left > 0 ? `⌛ ${fmtDur(left)}` : '⌛ ending',
+      color: left < URGENT_SECONDS ? RED : GRAY,
+    })
+  }
   return segs
 }
 
-/** [Model · effort] · folder | branch | job 123456 · 2×gpu[0,1] */
-export function line1(s: Snapshot): Seg[] {
+/** [Model · effort] · folder | branch | job 123456 · 2×gpu[0,1] · ⌛ 1h12m */
+export function line1(s: Snapshot, nowMs = Date.now()): Seg[] {
   const model: Seg[] = []
   if (s.model) {
     model.push({ text: '[', color: CYAN }, { text: modelLabel(s.model), color: CYAN, action: 'model' })
@@ -163,7 +200,7 @@ export function line1(s: Snapshot): Seg[] {
     model.push({ text: ']', color: CYAN })
   }
   const head = join([model, s.folder ? [{ text: s.folder }] : []], { text: ' · ' })
-  return join([head, s.branch ? [{ text: s.branch }] : [], s.slurm ? slurmSegs(s.slurm) : []], SEP)
+  return join([head, s.branch ? [{ text: s.branch }] : [], s.slurm ? slurmSegs(s.slurm, nowMs) : []], SEP)
 }
 
 /** context bar · pct% | $cost | ⏱ time | 5h bar | 7d bar */
