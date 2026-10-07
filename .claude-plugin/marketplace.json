@@ -1,0 +1,13 @@
+{
+  "name": "pace-line",
+  "description": "Dídac's two-line status bar for Claude Code, with usage pace arrows.",
+  "owner": {
+    "name": "Dídac"
+  },
+  "plugins": [
+    {
+      "name": "pace-line",
+      "source": "./"
+    }
+  ]
+}
