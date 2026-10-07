@@ -4,7 +4,7 @@
 import type { Limit, Slurm, Snapshot } from '../types'
 
 /** `action` marks a segment drawn as a button that opens that picker. */
-export type Seg = { text: string; color?: string; action?: 'model' | 'effort' | 'job' }
+export type Seg = { text: string; color?: string; action?: 'model' | 'effort' | 'job' | 'jobs' }
 
 // The script's ANSI colours as Ghostty's palette draws them (its defaults:
 // no theme or palette is set). A mod can't emit palette codes: names and

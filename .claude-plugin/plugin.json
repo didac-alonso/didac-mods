@@ -1,9 +1,88 @@
 {
   "name": "pace-line",
-  "version": "0.1.1",
-  "description": "Two-line coloured usage band above the prompt: model, folder, branch, context, cost, time, and 5h/7d limits with pace arrows.",
+  "version": "0.2.0",
+  "description": "Coloured usage band above the prompt (model, folder, branch, context, cost, time, 5h/7d pace) plus a Slurm batch-job watcher: progress, live loss charts, GPUs, checkpoints, alerts and auto-resume.",
   "types": "./types/index.d.ts",
   "author": {
     "name": "Dídac"
+  },
+  "userConfig": {
+    "pollSeconds": {
+      "type": "number",
+      "title": "squeue every (s)",
+      "description": "How often squeue is read for your batch jobs.",
+      "required": false,
+      "default": 60
+    },
+    "gpuSeconds": {
+      "type": "number",
+      "title": "GPU refresh (s)",
+      "description": "GPU refresh for the job selected in /jobs, while the panel is open.",
+      "required": false,
+      "default": 30
+    },
+    "idleMinutes": {
+      "type": "number",
+      "title": "Idle GPU alert (min)",
+      "description": "Alert when an allocated GPU has been idle this long.",
+      "required": false,
+      "default": 10
+    },
+    "silentMinutes": {
+      "type": "number",
+      "title": "Silent log alert (min)",
+      "description": "Alert when a running job's log hasn't grown in this long.",
+      "required": false,
+      "default": 20
+    },
+    "nearLimitMinutes": {
+      "type": "number",
+      "title": "Near time limit (min)",
+      "description": "Alert when a job has this little time left.",
+      "required": false,
+      "default": 30
+    },
+    "staleCkptMinutes": {
+      "type": "number",
+      "title": "Stale checkpoint (min)",
+      "description": "Alert when the newest checkpoint is this old.",
+      "required": false,
+      "default": 60
+    },
+    "pendingMinutes": {
+      "type": "number",
+      "title": "Long pending (min)",
+      "description": "Alert when a job has been pending this long.",
+      "required": false,
+      "default": 120
+    },
+    "maxResumes": {
+      "type": "number",
+      "title": "Auto-resumes per chain",
+      "description": "Automatic resubmits from a checkpoint per job chain before asking.",
+      "required": false,
+      "default": 3
+    },
+    "excludeNames": {
+      "type": "string",
+      "title": "Ignore job names",
+      "description": "Job names never watched (comma-separated).",
+      "required": false,
+      "default": "dev-shell,interactive"
+    },
+    "discordChatId": {
+      "type": "string",
+      "title": "Discord chat id",
+      "description": "Your Discord DM chat id; alerts go there through the Discord plugin.",
+      "required": false,
+      "default": ""
+    },
+    "discordWebhook": {
+      "type": "string",
+      "title": "Discord webhook URL",
+      "description": "A Discord webhook URL, used when the Discord plugin isn't connected.",
+      "required": false,
+      "default": ""
+    }
   }
 }

@@ -15,6 +15,27 @@ A two-line status bar for Claude Code, drawn under the prompt:
 
 Colours are Ghostty's default palette as hex (see the top of `hooks/format.ts`).
 
+## Batch jobs
+
+On a Slurm cluster pace-line also watches every batch job of yours (one `squeue` a minute; your `dev-shell` and interactive jobs are skipped):
+
+- **Band, line 3**: each active job's state, GPUs, progress (`ep 3/20`, `62%` or `[12/20]`), last loss with its trend, and time left; sweeps fold into `sweep[8] 3✓2▶3◌`; the newest alert in red or orange.
+- **`/jobs`** (or the *Batch jobs* tab of `/job`): the job list, then for the selected job its time and progress bars with ETA, a braille chart of the train loss (raw and EMA), the first two `val_*` metrics with their best marked, `lr` and throughput sparklines, per-node GPU rows (over `ssh <node> nvidia-smi`), the newest checkpoint (age, size), disk space, and the log's last lines. A sweep shows every task's loss on one chart. Buttons: Copy ssh, Copy `tail -f`, Resume from checkpoint, Cancel.
+- **Alerts**, once per job and kind: finished or failed (with the last error line), CUDA OOM, traceback, NCCL errors, NaN/inf metrics, a log silent for 20 min, a GPU idle for 10 min, pending for 2 h, 30 min to the time limit, no checkpoint for 60 min. Each shows as a toast, goes to Discord (the Discord plugin's DM, given `discordChatId`, or a `discordWebhook`) and to Claude as one message per batch.
+- **Auto-resume**: a job that ends in TIMEOUT, NODE_FAIL or PREEMPTED after writing a checkpoint is resubmitted from its `sacct` submit line with `RESUME=<checkpoint>` added to `--export`, up to 3 times per chain (`/jobs resume <id>` by hand).
+
+It reads what the jobs write, by convention (also given to Claude in every session on the cluster):
+
+```
+runs/slurm-<jobid>.out                 sbatch --output=runs/slurm-%j.out
+runs/<jobid>/metrics.jsonl             {"time", "step", "total_steps", "epoch", "total_epochs", "loss", "val_*", "lr", "samples_per_s"}
+runs/<jobid>/checkpoints/              epoch=E-step=S.pt, checkpoint-S/, ... ; resume from $RESUME
+```
+
+`/jobs init` copies `jobkit.py` (log_metrics, save_checkpoint, latest_checkpoint, load_resume) and `slurm/train.template.sbatch` (torchrun, multi-GPU and multi-node) into the current project. Thresholds, intervals and Discord are in `/plugin` → pace-line → configure.
+
+The watcher runs inside a Claude Code session: with no session open, nothing is polled or resubmitted.
+
 ## Install
 
 At a Claude Code prompt (Claude Code 2.1.292 or newer):
