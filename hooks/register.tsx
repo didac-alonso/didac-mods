@@ -302,7 +302,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        {'Client' in elements
+        {(e.surface === 'terminal' || e.surface === 'desktop') && 'Client' in elements
           ? (
             // Terminal and desktop: a region that draws its own colours and takes clicks.
             <elements.Client
