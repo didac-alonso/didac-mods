@@ -1,0 +1,81 @@
+{
+  "name": "job-watch",
+  "version": "0.1.0",
+  "description": "Your Slurm batch jobs on the cluster, watched from your own computer over one ssh call a minute: progress, loss and val curves, GPU history and sweeps, drawn as charts in the desktop app.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Dídac"
+  },
+  "userConfig": {
+    "host": {
+      "type": "string",
+      "title": "ssh host",
+      "description": "The ssh alias of the cluster's login node. It must log in without a prompt (key auth).",
+      "required": false,
+      "default": "explorer"
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Poll every (s)",
+      "description": "How often the cluster is asked about your jobs, in one ssh call.",
+      "required": false,
+      "default": 60
+    },
+    "gpuSeconds": {
+      "type": "number",
+      "title": "GPU refresh (s)",
+      "description": "GPU refresh for the job selected in /jobs, while the pane is open.",
+      "required": false,
+      "default": 30
+    },
+    "historySamples": {
+      "type": "number",
+      "title": "GPU history samples",
+      "description": "GPU readings kept per job for the history chart.",
+      "required": false,
+      "default": 480
+    },
+    "idleMinutes": {
+      "type": "number",
+      "title": "Idle GPU alert (min)",
+      "description": "Alert when a GPU of a running job sits at 0% with no process this long.",
+      "required": false,
+      "default": 10
+    },
+    "silentMinutes": {
+      "type": "number",
+      "title": "Silent log alert (min)",
+      "description": "Alert when a running job's log has not grown this long.",
+      "required": false,
+      "default": 20
+    },
+    "nearLimitMinutes": {
+      "type": "number",
+      "title": "Near time limit (min)",
+      "description": "Alert this long before a job's time limit (at most its last quarter).",
+      "required": false,
+      "default": 30
+    },
+    "staleCkptMinutes": {
+      "type": "number",
+      "title": "Stale checkpoint (min)",
+      "description": "Alert when a running job's newest checkpoint is older than this.",
+      "required": false,
+      "default": 60
+    },
+    "pendingMinutes": {
+      "type": "number",
+      "title": "Long pending (min)",
+      "description": "Alert when a job has been pending this long.",
+      "required": false,
+      "default": 120
+    },
+    "excludeNames": {
+      "type": "string",
+      "title": "Ignored job names",
+      "description": "Comma-separated job names never watched.",
+      "required": false,
+      "default": "dev-shell,interactive"
+    }
+  }
+}

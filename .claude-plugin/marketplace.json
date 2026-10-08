@@ -14,6 +14,11 @@
       "name": "cluster-context",
       "source": "./plugins/cluster-context",
       "description": "Tells Claude which Slurm node it is on, keeps downloads and HF caches on scratch, and asks before a new allocation."
+    },
+    {
+      "name": "job-watch",
+      "source": "./plugins/job-watch",
+      "description": "From your own computer: your cluster jobs over one ssh call a minute, with loss, val, GPU-history and sweep charts in the desktop app, and alerts as toasts."
     }
   ]
 }
