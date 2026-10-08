@@ -102,7 +102,7 @@ export type Accounting = {
 /**
  * `sacct -X -n -P -o <SACCT_FIELDS>` for one job. SubmitLine is last and may
  * itself hold `|` or newlines (an --wrap script), so it takes all the rest.
- * The state can read "CANCELLED by 104654"; only the first word is kept.
+ * The state can read "CANCELLED by 1000"; only the first word is kept.
  */
 export function parseSacct(out: string): Accounting | null {
   const text = out.replace(/\n+$/, '')

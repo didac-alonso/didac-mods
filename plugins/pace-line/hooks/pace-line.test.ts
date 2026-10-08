@@ -160,7 +160,7 @@ test('inside a Slurm job the band shows it from the environment', async ($, on) 
   mock.clock(on, { now: NOW })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
-  on('session.cwd', () => ({ value: '/home/alonsolopez.d/project' }))
+  on('session.cwd', () => ({ value: '/home/demo/project' }))
   on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('settings.read', () => ({ value: {} }))
@@ -168,7 +168,7 @@ test('inside a Slurm job the band shows it from the environment', async ($, on) 
   on('env.get', (_$, e) => ({ value: env[e.name] }))
   on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: '' }))
 
-  await $.session.start({ cwd: '/home/alonsolopez.d/project', surface: 'terminal', isInteractive: true })
+  await $.session.start({ cwd: '/home/demo/project', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({
     plugin: 'pace-line',
     surface: 'terminal',
@@ -182,14 +182,14 @@ test('inside a Slurm job the band shows it from the environment', async ($, on) 
 
 // Captured from a real allocation on explorer (job 10897310, gpu-interactive).
 const SCONTROL = `JobId=10897310 JobName=pace-line-check
-   UserId=alonsolopez.d(104654) GroupId=users(100) MCS_label=N/A
-   Priority=5046 Nice=0 Account=l.torresani QOS=normal
+   UserId=demo(1000) GroupId=users(100) MCS_label=N/A
+   Priority=5046 Nice=0 Account=lab-acct QOS=normal
    JobState=RUNNING Reason=None Dependency=(null)
    RunTime=00:00:02 TimeLimit=00:03:00 TimeMin=N/A
    StartTime=2026-10-07T11:40:16 EndTime=2026-10-07T11:43:16 Deadline=N/A
    Partition=gpu-interactive AllocNode:Sid=10.99.200.107:2462567
-   NodeList=d1012
-   BatchHost=d1012
+   NodeList=gpu02
+   BatchHost=gpu02
    AllocTRES=cpu=1,mem=1G,node=1,billing=101,gres/gpu=1
 `
 const SMI = '0, GPU-5f2c, Tesla V100-SXM2-32GB, 31, 12698, 32768, 39, 44.24, 300.00\n'
@@ -206,7 +206,7 @@ describe('slurm', () => {
   test('scontrol show job, from a real job', () => {
     expect(parseScontrol(SCONTROL)).toEqual({
       id: '10897310', name: 'pace-line-check', state: 'RUNNING', partition: 'gpu-interactive',
-      account: 'l.torresani', node: 'd1012', nodeList: 'd1012', runSeconds: 2, limitSeconds: 180,
+      account: 'lab-acct', node: 'gpu02', nodeList: 'gpu02', runSeconds: 2, limitSeconds: 180,
       cpus: '1', mem: '1G', gpus: '1',
     })
     expect(parseScontrol('slurm_load_jobs error: Invalid job id specified')).toBe(null)
@@ -243,7 +243,7 @@ test('the job panel: scontrol details and a card per GPU', async ($, on) => {
   mock.clock(on, { now: NOW })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
-  on('session.cwd', () => ({ value: '/home/alonsolopez.d' }))
+  on('session.cwd', () => ({ value: '/home/demo' }))
   on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('settings.read', () => ({ value: {} }))
   const env: Record<string, string> = { SLURM_JOB_ID: '10897310', SLURM_STEP_GPUS: '0', SLURM_JOB_END_TIME: String(Math.floor(NOW / 1000) + 178) }
@@ -263,7 +263,7 @@ test('the job panel: scontrol details and a card per GPU', async ($, on) => {
   on('ui.toast', () => ({ value: undefined }))
   on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: '' }))
 
-  await $.session.start({ cwd: '/home/alonsolopez.d', surface: 'terminal', isInteractive: true })
+  await $.session.start({ cwd: '/home/demo', surface: 'terminal', isInteractive: true })
   // The engine stamps origin and presentation on a run; the test leaves them out.
   await $.command.run({ command: 'job', args: '' } as Parameters<typeof $.command.run>[0])
   expect(ran.filter(a => a[0] === 'scontrol')).toEqual([['scontrol', 'show', 'job', '10897310']])
@@ -276,7 +276,7 @@ test('the job panel: scontrol details and a card per GPU', async ($, on) => {
     props: { title: 'job 10897310', isFocused: true, bodyColumns: 90, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
   })
   expect(await ui.find({ type: 'Text', text: '● RUNNING' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'gpu-interactive · d1012 · l.torresani' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'gpu-interactive · gpu02 · lab-acct' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^⌛ 2m left/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'GPU 0' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '  12.4 / 32.0 GiB' })).toBeDefined()
@@ -286,7 +286,7 @@ test('the job panel: scontrol details and a card per GPU', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: 'GPUs live every 5s' })).toBeDefined()
 
   await ui.press({ key: 'copy-ssh' })
-  expect(copied).toEqual(['ssh d1012'])
+  expect(copied).toEqual(['ssh gpu02'])
   await ui.press({ key: 'refresh' })
   expect(ran.filter(a => a[0] === 'scontrol').length).toBe(2)
 })
@@ -295,7 +295,7 @@ test('a toast once, 10 minutes before the job ends', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
-  on('session.cwd', () => ({ value: '/home/alonsolopez.d' }))
+  on('session.cwd', () => ({ value: '/home/demo' }))
   on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('settings.read', () => ({ value: {} }))
   on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
@@ -306,7 +306,7 @@ test('a toast once, 10 minutes before the job ends', async ($, on) => {
   const toasts: string[] = []
   on('ui.toast', (_$, e) => (toasts.push(e.text), { value: undefined }))
 
-  await $.session.start({ cwd: '/home/alonsolopez.d', surface: 'terminal', isInteractive: true })
+  await $.session.start({ cwd: '/home/demo', surface: 'terminal', isInteractive: true })
   expect(toasts).toEqual([])
   await clock.advance(60_000) // 10 minutes left
   expect(toasts).toEqual(['⌛ job 4242 ends in 10m: save your work'])

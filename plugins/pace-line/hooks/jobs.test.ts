@@ -80,7 +80,7 @@ describe('parse', () => {
     expect(a).toEqual({ jobId: '2001', state: 'TIMEOUT', exitCode: '0:0', elapsedS: 86412, workDir: '/w', submitLine: 'sbatch --export=ALL,X=1 slurm/train.sbatch' })
     const wrap = parseSacct("10897310|check|COMPLETED|0:0|00:00:03|/home/u|sbatch --wrap=\"env | grep X\nnvidia-smi\"\n")
     expect(wrap?.submitLine).toBe('sbatch --wrap="env | grep X\nnvidia-smi"')
-    expect(parseSacct('3|j|CANCELLED by 104654|0:15|00:01:00|/w|sbatch a.sh')?.state).toBe('CANCELLED')
+    expect(parseSacct('3|j|CANCELLED by 1000|0:15|00:01:00|/w|sbatch a.sh')?.state).toBe('CANCELLED')
   })
 
   test('times in the cluster zone', () => {
@@ -271,7 +271,7 @@ function cluster(on: On, c: Cluster) {
 
 const startSession = async ($: Engine, on: On, submitted: string[]) => {
   mock.store(on)
-  mock.env(on, { USER: 'alonsolopez.d', SLURM_JOB_ID: '10897494' })
+  mock.env(on, { USER: 'demo', SLURM_JOB_ID: '10897494' })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.cwd', () => ({ value: '/w' }))

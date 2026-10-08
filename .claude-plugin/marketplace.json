@@ -1,13 +1,19 @@
 {
-  "name": "pace-line",
-  "description": "Dídac's two-line status bar for Claude Code, with usage pace arrows.",
+  "name": "didac-mods",
+  "description": "Dídac's Claude Code mods for working on a Slurm GPU cluster.",
   "owner": {
     "name": "Dídac"
   },
   "plugins": [
     {
       "name": "pace-line",
-      "source": "./"
+      "source": "./plugins/pace-line",
+      "description": "Usage band with pace arrows, plus a Slurm batch-job watcher with charts, alerts and auto-resume."
+    },
+    {
+      "name": "cluster-context",
+      "source": "./plugins/cluster-context",
+      "description": "Tells Claude which Slurm node it is on, keeps downloads and HF caches on scratch, and asks before a new allocation."
     }
   ]
 }

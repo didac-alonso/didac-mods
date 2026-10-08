@@ -1,0 +1,24 @@
+{
+  "name": "cluster-context",
+  "version": "0.2.0",
+  "description": "Tells Claude which Slurm node it is on (GPUs, time left), keeps Hugging Face caches and big downloads on /scratch, and asks before starting a new allocation when this node could do the work.",
+  "author": {
+    "name": "Dídac"
+  },
+  "userConfig": {
+    "scratchRoot": {
+      "type": "string",
+      "title": "Scratch root",
+      "description": "Where downloads, weights, datasets and caches belong. Leave empty for /scratch/$USER.",
+      "required": false,
+      "default": ""
+    },
+    "minMinutesLeft": {
+      "type": "number",
+      "title": "Minutes left to keep work here",
+      "description": "On a GPU node with at least this many minutes left, a new srun/sbatch/salloc asks you first.",
+      "required": false,
+      "default": 30
+    }
+  }
+}
