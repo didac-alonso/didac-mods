@@ -41,7 +41,7 @@ The watcher runs inside a Claude Code session: with no session open, nothing is 
 At a Claude Code prompt (Claude Code 2.1.292 or newer):
 
 ```
-/plugin marketplace add didac-alonso/claude-mods
+/plugin marketplace add didac-alonso/didac-mods
 /plugin install pace-line@didac-mods
 ```
 

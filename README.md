@@ -1,4 +1,4 @@
-# claude-mods
+# didac-mods
 
 Claude Code mods for working on a Slurm GPU cluster.
 
@@ -12,7 +12,7 @@ Claude Code mods for working on a Slurm GPU cluster.
 At a Claude Code prompt (Claude Code 2.1.292 or newer):
 
 ```
-/plugin marketplace add didac-alonso/claude-mods
+/plugin marketplace add didac-alonso/didac-mods
 /plugin install pace-line@didac-mods
 /plugin install cluster-context@didac-mods
 ```
