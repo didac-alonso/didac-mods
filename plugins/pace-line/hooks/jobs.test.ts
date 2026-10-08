@@ -333,3 +333,13 @@ test('a TIMEOUT with a fresh checkpoint is resubmitted with RESUME, and Claude i
   expect(submitted[0]).toContain('resubmitted as 3001 from epoch=0-step=400.pt (resume 1/3)')
   expect(submitted[0]).toContain('t4-train (2001) TIMEOUT')
 })
+
+test('off a cluster, /jobs goes on to the plugin that owns it', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('process.run', () => ({ value: { exitCode: 127, stdout: '', stderr: 'squeue: not found', isStdoutTruncated: false, isStderrTruncated: false } }))
+  // Beneath pace-line: another plugin's /jobs (job-watch on a laptop).
+  on('command.run', { command: 'jobs' }, () => ({ text: 'job-watch answered' }))
+  await startSession($, on, [])
+  const r = await $.command.run({ command: 'jobs', args: '' } as Parameters<typeof $.command.run>[0])
+  expect(r.text).toBe('job-watch answered')
+})

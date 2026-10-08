@@ -1,6 +1,6 @@
 {
   "name": "pace-line",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Coloured usage band above the prompt (model, folder, branch, context, cost, time, 5h/7d pace) plus a Slurm batch-job watcher: progress, live loss charts, GPUs, checkpoints, alerts and auto-resume.",
   "types": "./types/index.d.ts",
   "author": {

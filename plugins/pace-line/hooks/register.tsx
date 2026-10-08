@@ -720,11 +720,13 @@ export const register: Register = (on, options) => {
     return { text: 'Opened the job panel.' }
   })
 
-  on('command.run', { command: 'jobs' }, async ($, e) => {
+  on('command.run', { command: 'jobs' }, async ($, e, next) => {
     const [sub, arg] = e.args.trim().split(/\s+/)
     if (sub === 'init') return { text: await initProject($) }
+    // Off a cluster pace-line never registered /jobs: it's another plugin's
+    // (job-watch, watching the cluster from a laptop).
+    if (!isWatching) return next(e)
     if (sub === 'resume' && arg) return { text: await resumeByHand($, arg) }
-    if (!isWatching) return { text: 'squeue is not available here: no batch jobs to watch.' }
     await openPanel($, 'jobs')
     return { text: 'Opened the batch jobs panel.' }
   })
