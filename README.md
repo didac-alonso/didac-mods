@@ -5,6 +5,7 @@ Claude Code mods for working on a Slurm GPU cluster.
 | Mod | What it does |
 | --- | --- |
 | [pace-line](plugins/pace-line) | A two-line usage band (model, folder, branch, context, cost, 5h/7d pace) and a watcher for your batch jobs: progress, loss charts, GPUs, checkpoints, alerts and auto-resume. |
+| [plan-line](plugins/plan-line) | Live progress bars right above the prompt for Claude's plans and multi-step work: stages, steps, agent strips, waiting and error states. A working fork of zycck's plan-progress. |
 | [cluster-context](plugins/cluster-context) | Tells Claude which node it is on (GPUs, time left), keeps downloads and Hugging Face caches on scratch, and asks before starting a new allocation when this node could do the work. |
 | [job-watch](plugins/job-watch) | For your laptop, not the cluster: the same job watcher over one `ssh <host> bash -s` a minute, with hoverable loss, val, GPU-history and sweep charts in the desktop app. Needs an ssh alias that logs in without a prompt. |
 
@@ -16,6 +17,7 @@ At a Claude Code prompt (Claude Code 2.1.292 or newer):
 /plugin marketplace add didac-alonso/didac-mods
 /plugin install pace-line@didac-mods
 /plugin install cluster-context@didac-mods
+/plugin install plan-line@didac-mods
 ```
 
 On your own computer, instead:

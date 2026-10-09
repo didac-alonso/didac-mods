@@ -1,0 +1,19 @@
+{
+  "name": "plan-line",
+  "version": "0.9.0",
+  "description": "Live plan progress bars right above the prompt (stages, steps, a pixel fill, agent strips, sounds). A fork of zycck's plan-progress that works without a registered tool.",
+  "author": {
+    "name": "Dídac"
+  },
+  "license": "MIT",
+  "userConfig": {
+    "doneBarSeconds": {
+      "type": "number",
+      "title": "Finished bar stays (seconds)",
+      "description": "Seconds a finished bar stays above the prompt while /plan-progress-autoclose is on",
+      "default": 20,
+      "min": 1
+    }
+  },
+  "types": "./types/index.d.ts"
+}

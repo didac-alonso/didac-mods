@@ -2,3 +2,6 @@
 .claude-plugin/types/
 plugins/*/.claude-plugin/types/
 node_modules/
+plugins/*/tests/register.mjs
+plugins/*/tests/register.results.json
+plugins/*/tests/look.html

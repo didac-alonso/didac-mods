@@ -19,6 +19,11 @@
       "name": "job-watch",
       "source": "./plugins/job-watch",
       "description": "From your own computer: your cluster jobs over one ssh call a minute, with loss, val, GPU-history and sweep charts in the desktop app, and alerts as toasts."
+    },
+    {
+      "name": "plan-line",
+      "source": "./plugins/plan-line",
+      "description": "Live plan progress bars right above the prompt, with agent strips and sounds; a working fork of plan-progress."
     }
   ]
 }
