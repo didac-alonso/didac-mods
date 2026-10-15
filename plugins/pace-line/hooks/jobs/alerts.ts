@@ -10,6 +10,8 @@ export type Thresholds = {
   nearLimitMinutes: number
   staleCkptMinutes: number
   pendingMinutes: number
+  /** A job that waited this long in the queue says when it starts. */
+  startedAfterMinutes: number
 }
 
 export const DEFAULT_THRESHOLDS: Thresholds = {
@@ -18,6 +20,7 @@ export const DEFAULT_THRESHOLDS: Thresholds = {
   nearLimitMinutes: 30,
   staleCkptMinutes: 60,
   pendingMinutes: 120,
+  startedAfterMinutes: 30,
 }
 
 /** States a job leaves squeue in; COMPLETED is the only good one. */
@@ -27,6 +30,9 @@ export const TERMINAL = new Set(['COMPLETED', 'FAILED', 'TIMEOUT', 'CANCELLED', 
 export function label(job: BatchJob): string {
   return `${job.name} (${job.id})`
 }
+
+/** How recent a start must be to be announced. */
+const STARTED_WINDOW_MIN = 10
 
 const ageMin = (now: number, t: number | null) => (t === null ? null : (now - t) / 60_000)
 
@@ -57,6 +63,12 @@ export function alertsFor(job: BatchJob, now: number, th: Thresholds): Alert[] {
 
   if (running) {
     const ranMin = ageMin(now, job.startedAt)
+    // Only a start just seen (a session opened hours later doesn't announce it), and not a sweep's
+    // tasks one by one: the sweep says so when it ends.
+    if (job.arrayId === null && job.submittedAt !== null && job.startedAt !== null && ranMin !== null && ranMin <= STARTED_WINDOW_MIN) {
+      const queued = (job.startedAt - job.submittedAt) / 60_000
+      if (queued >= th.startedAfterMinutes) add('started', 'info', `▶ ${label(job)} started after ${fmtDur(queued * 60)} in the queue`)
+    }
     const quiet = ageMin(now, job.logChangedAt ?? job.startedAt)
     if (ranMin !== null && ranMin >= th.silentMinutes && quiet !== null && quiet >= th.silentMinutes) {
       add('silent', 'warn', `⚠ ${label(job)}: log silent for ${fmtDur(quiet * 60)} (hung rank?)`)

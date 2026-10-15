@@ -505,6 +505,8 @@ async function deliver($: EngineInterface, alerts: Alert[]): Promise<void> {
   await update($, jobsAtom, s => ({ ...s, alerts: [...alerts, ...s.alerts].slice(0, 20) }))
 
   const text = alerts.map(a => a.text).join('\n')
+  // A start is news for the person, not work for Claude.
+  const forClaude = alerts.filter(a => a.kind !== 'started')
   if (cfg.discordChatId) {
     try {
       await $.mcp.call(DISCORD_SERVER, 'reply', { chat_id: cfg.discordChatId, text })
@@ -516,13 +518,14 @@ async function deliver($: EngineInterface, alerts: Alert[]): Promise<void> {
     await webhook($, cfg.discordWebhook, text)
   }
 
+  if (!forClaude.length) return
   const jobs = (await read($, jobsAtom)).jobs
-  const logs = [...new Set(alerts.map(a => jobs.find(j => j.id === a.job)?.stdout).filter(Boolean))]
+  const logs = [...new Set(forClaude.map(a => jobs.find(j => j.id === a.job)?.stdout).filter(Boolean))]
   try {
     await $.prompt.submit({
       text: [
         '[pace-line: batch-job alerts, from the job watcher, not typed by the user]',
-        text,
+        forClaude.map(a => a.text).join('\n'),
         logs.length ? `Logs: ${logs.join(', ')}` : '',
         'For a failure, read the end of its log and propose a fix. Do not resubmit unless the user asks: pace-line already resubmits TIMEOUTs from their latest checkpoint. For an idle GPU, a silent log or a long pending job, check it and say what you would do. For a resubmission, update the project EXPERIMENTS.md row if there is one. Keep it short.',
       ].filter(Boolean).join('\n'),

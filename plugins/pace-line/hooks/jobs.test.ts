@@ -198,6 +198,16 @@ describe('alerts', () => {
     expect(short(370)).toContain('nearLimit')
   })
 
+  test('started after a long queue, only right after it starts', () => {
+    const started = (queuedMin: number, ranMin: number) =>
+      alertsFor(job({ submittedAt: NOW - (queuedMin + ranMin) * 60_000, startedAt: NOW - ranMin * 60_000, elapsedS: ranMin * 60 }), NOW, th).find(a => a.kind === 'started')
+    expect(started(90, 1)?.text).toBe('▶ t4-train (2001) started after 1h30m in the queue')
+    expect(started(90, 1)?.level).toBe('info')
+    expect(started(10, 1)).toBeUndefined()
+    expect(started(90, 45)).toBeUndefined()
+    expect(alertsFor(job({ arrayId: '2002', submittedAt: NOW - 91 * 60_000, startedAt: NOW - 60_000 }), NOW, th).map(a => a.kind)).not.toContain('started')
+  })
+
   test('pending past the threshold, with its reason', () => {
     const a = alertsFor(job({ state: 'PENDING', reason: 'Priority', submittedAt: NOW - 3 * 3600_000, startedAt: null }), NOW, th)
     expect(a.map(x => x.kind)).toEqual(['pending'])

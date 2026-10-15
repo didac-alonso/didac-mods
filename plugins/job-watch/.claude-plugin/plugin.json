@@ -1,6 +1,6 @@
 {
   "name": "job-watch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Your Slurm batch jobs on the cluster, watched from your own computer over one ssh call a minute: progress, loss and val curves, GPU history and sweeps, drawn as charts in the desktop app.",
   "types": "./types/index.d.ts",
   "author": {
@@ -69,6 +69,13 @@
       "description": "Alert when a job has been pending this long.",
       "required": false,
       "default": 120
+    },
+    "startedAfterMinutes": {
+      "type": "number",
+      "title": "Started after a queue (min)",
+      "description": "A job that waited at least this long in the queue says when it starts.",
+      "required": false,
+      "default": 30
     },
     "excludeNames": {
       "type": "string",

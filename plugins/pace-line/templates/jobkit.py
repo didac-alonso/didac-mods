@@ -14,19 +14,32 @@ imported when you save or load a checkpoint.
             save_checkpoint({"model": model.state_dict(), "opt": opt.state_dict(), "step": step},
                             step=step, epoch=epoch)
 
+    # at the end, a Discord card (discord-drop's webhook): held while you're
+    # at a Claude session, sent when you're away
+    notify("detr-r50 finished", f"val mAP {mAP:.1f}", fields=[("mAP", mAP), ("baseline", 41.2)],
+           image="runs/curve.png")
+
 Layout, all relative to the directory the job was submitted from:
     runs/slurm-<jobid>.out                    the log (sbatch --output)
     runs/<jobid>/metrics.jsonl                one JSON object per logged step
     runs/<jobid>/checkpoints/epoch=E-step=S.pt
+    runs/<jobid>/notified.json                the job reported itself (pace-line doesn't repeat it)
 """
 
 from __future__ import annotations
 
 import json
 import math
+import mimetypes
 import os
 import re
+import shlex
+import socket
+import subprocess
+import sys
 import time
+import urllib.request
+import uuid
 from pathlib import Path
 
 __all__ = [
@@ -38,6 +51,9 @@ __all__ = [
     "latest_checkpoint",
     "resume_path",
     "load_resume",
+    "notify",
+    "notify_exit",
+    "repro_card",
 ]
 
 _CKPT = re.compile(r"(?:epoch=(\d+)-)?step=(\d+)\.pt$")
@@ -150,3 +166,199 @@ def load_resume(map_location="cpu"):
     import torch
 
     return torch.load(p, map_location=map_location, weights_only=False)
+
+
+# ── Discord cards (discord-drop) ──────────────────────────────────────────
+# The same cards discord-drop sends from Claude's session, from inside the job:
+# its webhook (DISCORD_WEBHOOK_URL, else ~/.claude/discord-drop/webhook), its
+# away time (config.json) and the last message you wrote to any Claude session
+# (presence.json). $HOME is shared, so a job on any node reads them.
+
+_DROP = Path.home() / ".claude" / "discord-drop"
+_COLOR = {"result": 0x2ECC71, "urgent": 0xE74C3C, "needs-you": 0xF1C40F, "progress": 0x3498DB, "started": 0x9B59B6, "done": 0x5865F2}
+_ICON = {"result": "\u2705", "urgent": "\U0001f6d1", "needs-you": "\u23f8\ufe0f", "progress": "\u23f3", "started": "\u25b6\ufe0f", "done": "\u2714\ufe0f"}
+_MAX_FILES = 10
+_MAX_BYTES = 10 * 1024 * 1024
+_UA = "DiscordBot (https://github.com/didac-alonso/didac-mods, 1) jobkit"
+
+
+def _cut(text: str, n: int) -> str:
+    return text if len(text) <= n else text[: n - 1] + "\u2026"
+
+
+def _webhook() -> str | None:
+    url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if url:
+        return url
+    try:
+        return (_DROP / "webhook").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _user_here() -> bool:
+    """True when you wrote to a Claude session within discord-drop's away time."""
+    try:
+        away = float(json.loads((_DROP / "config.json").read_text()).get("awayMinutes", 30))
+    except (OSError, ValueError, AttributeError):
+        away = 30.0
+    try:
+        sessions = json.loads((_DROP / "presence.json").read_text()).get("sessions", {})
+    except (OSError, ValueError, AttributeError):
+        return False
+    latest = max((s.get("lastUserAt", 0) for s in sessions.values() if isinstance(s, dict)), default=0)
+    return time.time() * 1000 - latest < away * 60_000
+
+
+def _git(*args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def repro_card(seed: int | None = None) -> list[dict]:
+    """Card fields that let a result be reproduced: commit (and whether the tree
+    was dirty), job, seed, best and latest checkpoint, the exact command."""
+    fields = []
+    sha = _git("rev-parse", "--short", "HEAD")
+    if sha:
+        dirty = _git("status", "--porcelain")
+        stat = (_git("diff", "--shortstat") or "").strip() if dirty else ""
+        fields.append({"name": "commit", "value": f"`{sha}`" + (f" + {stat}" if stat else " (dirty)" if dirty else ""), "inline": True})
+    job = os.environ.get("SLURM_JOB_ID")
+    if job:
+        fields.append({"name": "job", "value": f"`{job}`", "inline": True})
+    if seed is not None:
+        fields.append({"name": "seed", "value": str(seed), "inline": True})
+    ckpts = run_dir() / "checkpoints"
+    if ckpts.is_dir():
+        best = ckpts / "best.json"
+        if best.exists():
+            try:
+                b = json.loads(best.read_text())
+                fields.append({"name": "best", "value": f"`{b.get('from')}` ({b.get('metric'):.4g})", "inline": True})
+            except (ValueError, TypeError):
+                pass
+        last = latest_checkpoint(ckpts)
+        if last:
+            fields.append({"name": "checkpoint", "value": f"`{last}`", "inline": False})
+    cmd = " ".join(shlex.quote(a) for a in [Path(sys.executable).name, *sys.argv])
+    fields.append({"name": "command", "value": f"`{_cut(cmd, 1000)}`", "inline": False})
+    return fields
+
+
+def _fields(fields) -> list[dict]:
+    out = []
+    for f in fields or ():
+        if isinstance(f, dict):
+            name, value, inline = f.get("name", ""), f.get("value", ""), f.get("inline", True)
+        else:
+            name, value, inline = (list(f) + [True])[:3]
+        value = _number(value)
+        value = f"{value:.4g}" if isinstance(value, float) else str(value)
+        out.append({"name": _cut(str(name) or "\u200b", 256), "value": _cut(value or "\u200b", 1024), "inline": bool(inline)})
+    return out[:25]
+
+
+def _card(kind: str, title: str, text: str, fields: list[dict], image: str | None, url: str | None) -> dict:
+    job = os.environ.get("SLURM_JOB_ID")
+    name = os.environ.get("SLURM_JOB_NAME")
+    host = socket.gethostname().split(".")[0]
+    embed = {
+        "color": _COLOR[kind],
+        "title": _cut(f"{_ICON[kind]} {title}", 256),
+        "author": {"name": _cut(f"{name} ({job})" if job and name else f"jobkit \u00b7 {host}", 256)},
+        "footer": {"text": f"jobkit \u00b7 {host}" + (f" \u00b7 job {job}" if job else "")},
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    room = max(200, 5800 - len(embed["title"]) - sum(len(f["name"]) + len(f["value"]) for f in fields))
+    if text:
+        embed["description"] = _cut(text, min(4096, room))
+    if fields:
+        embed["fields"] = fields
+    if url:
+        embed["url"] = url
+    if image:
+        embed["image"] = {"url": f"attachment://{image}"}
+    return embed
+
+
+def _post(webhook: str, payload: dict, uploads: list[tuple[str, Path]]) -> bool:
+    boundary = uuid.uuid4().hex
+    chunks = [f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\nContent-Type: application/json\r\n\r\n'.encode(),
+              json.dumps(payload).encode(), b"\r\n"]
+    for i, (name, path) in enumerate(uploads):
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        chunks += [f'--{boundary}\r\nContent-Disposition: form-data; name="files[{i}]"; filename="{name}"\r\nContent-Type: {ctype}\r\n\r\n'.encode(),
+                   path.read_bytes(), b"\r\n"]
+    chunks.append(f"--{boundary}--\r\n".encode())
+    base = re.sub(r"[?#].*$", "", webhook).rstrip("/")
+    req = urllib.request.Request(base + "?wait=true", data=b"".join(chunks), method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return 200 <= r.status < 300
+
+
+def notify(title: str, text: str = "", *, fields=(), image: str | os.PathLike | None = None, files=(),
+           kind: str = "result", repro: bool = True, seed: int | None = None, url: str | None = None,
+           force: bool = False, final: bool = True) -> bool:
+    """Sends a Discord card through discord-drop's webhook. Rank 0 only.
+
+    Held (not sent) while you're at a Claude session (you wrote to one within
+    its away time, 30 min by default), unless `force`. `kind` is "result",
+    "urgent", "done" or "started"; `fields` are (name, value[, inline]) pairs or
+    dicts; `image` shows inside the card, `files` go under it (10 at most,
+    10 MB each; others are skipped). `repro` adds commit, job, seed, checkpoint
+    and command. A `final` result or failure writes runs/<jobid>/notified.json
+    so pace-line doesn't send its own card for the job's end.
+
+    Never raises; True when Discord took the card."""
+    if not is_main():
+        return False
+    try:
+        kind = kind if kind in _COLOR else "result"
+        held = not force and _user_here()
+        sent = False
+        hook = _webhook()
+        if not held and hook:
+            uploads: list[tuple[str, Path]] = []
+            used: set[str] = set()
+            for p in ([image] if image else []) + list(files):
+                path = Path(p)
+                if not path.is_file() or path.stat().st_size > _MAX_BYTES or len(uploads) >= _MAX_FILES:
+                    continue
+                name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name) or "file"
+                while name in used:
+                    name = "_" + name
+                used.add(name)
+                uploads.append((name, path))
+            shown = uploads[0][0] if image and uploads and uploads[0][1] == Path(image) else None
+            card_fields = _fields(fields) + (repro_card(seed) if repro else [])
+            embed = _card(kind, title, text, card_fields[:25], shown, url)
+            payload = {"embeds": [embed], "allowed_mentions": {"parse": []},
+                       "attachments": [{"id": i, "filename": n} for i, (n, _) in enumerate(uploads)]}
+            sent = _post(hook, payload, uploads)
+        if final and kind in ("result", "urgent", "done"):
+            (run_dir() / "notified.json").write_text(json.dumps({"at": time.time(), "kind": kind, "title": title, "sent": sent, "held": held}))
+        return sent
+    except Exception:  # a card must never take a training run down
+        return False
+
+
+def notify_exit(code: int, log: str | os.PathLike | None = None, lines: int = 15) -> bool:
+    """The sbatch trap's card for a job that failed: its exit code and the end of
+    its log. Skips 0 (success) and SIGTERM/SIGKILL (143/137: a TIMEOUT pace-line
+    resumes, or your own scancel)."""
+    if code in (0, 137, 143):
+        return False
+    job = os.environ.get("SLURM_JOB_ID", "")
+    path = Path(log) if log else Path("runs") / f"slurm-{job}.out"
+    try:
+        tail = path.read_text(errors="replace").splitlines()[-lines:]
+    except OSError:
+        tail = []
+    body = "```\n" + _cut("\n".join(tail), 1500) + "\n```" if tail else ""
+    name = os.environ.get("SLURM_JOB_NAME", "job")
+    return notify(f"{name} failed (exit {code})", body, fields=[("log", f"`{path}`", False)], kind="urgent")

@@ -48,6 +48,7 @@ function configFrom(options: Readonly<Record<string, unknown>>): Config {
     nearLimitMinutes: num('nearLimitMinutes', DEFAULT_THRESHOLDS.nearLimitMinutes),
     staleCkptMinutes: num('staleCkptMinutes', DEFAULT_THRESHOLDS.staleCkptMinutes),
     pendingMinutes: num('pendingMinutes', DEFAULT_THRESHOLDS.pendingMinutes),
+    startedAfterMinutes: num('startedAfterMinutes', DEFAULT_THRESHOLDS.startedAfterMinutes),
     exclude: str('excludeNames', 'dev-shell,interactive').split(',').map(s => s.trim()).filter(Boolean),
   }
 }

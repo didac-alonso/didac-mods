@@ -21,7 +21,7 @@ On a Slurm cluster pace-line also watches every batch job of yours (one `squeue`
 
 - **Band, line 3**: each active job's state, GPUs, progress (`ep 3/20`, `62%` or `[12/20]`), last loss with its trend, and time left; sweeps fold into `sweep[8] 3✓2▶3◌`; the newest alert in red or orange.
 - **`/jobs`** (or the *Batch jobs* tab of `/job`): the job list, then for the selected job its time and progress bars with ETA, a braille chart of the train loss (raw and EMA), the first two `val_*` metrics with their best marked, `lr` and throughput sparklines, per-node GPU rows (over `ssh <node> nvidia-smi`), the newest checkpoint (age, size), disk space, and the log's last lines. A sweep shows every task's loss on one chart. Buttons: Copy ssh, Copy `tail -f`, Resume from checkpoint, Cancel.
-- **Alerts**, once per job and kind: finished or failed (with the last error line), CUDA OOM, traceback, NCCL errors, NaN/inf metrics, a log silent for 20 min, a GPU idle for 10 min, pending for 2 h, 30 min to the time limit, no checkpoint for 60 min. Each shows as a toast, goes to Discord (the Discord plugin's DM, given `discordChatId`, or a `discordWebhook`) and to Claude as one message per batch.
+- **Alerts**, once per job and kind: finished or failed (with the last error line), CUDA OOM, traceback, NCCL errors, NaN/inf metrics, a log silent for 20 min, a GPU idle for 10 min, pending for 2 h, started after 30 min or more in the queue (not a sweep's tasks one by one), 30 min to the time limit, no checkpoint for 60 min. Each shows as a toast and goes to Claude as one message per batch (a start only to you). With [discord-drop](../discord-drop) installed they become Discord cards while you're away, a finished job's with its loss chart; without it, to the Discord plugin's DM (`discordChatId`) or a plain `discordWebhook`.
 - **Auto-resume**: a job that ends in TIMEOUT, NODE_FAIL or PREEMPTED after writing a checkpoint is resubmitted from its `sacct` submit line with `RESUME=<checkpoint>` added to `--export`, up to 3 times per chain (`/jobs resume <id>` by hand).
 
 It reads what the jobs write, by convention (also given to Claude in every session on the cluster):
@@ -32,7 +32,7 @@ runs/<jobid>/metrics.jsonl             {"time", "step", "total_steps", "epoch", 
 runs/<jobid>/checkpoints/              epoch=E-step=S.pt, checkpoint-S/, ... ; resume from $RESUME
 ```
 
-`/jobs init` copies `jobkit.py` (log_metrics, save_checkpoint, latest_checkpoint, load_resume) and `slurm/train.template.sbatch` (torchrun, multi-GPU and multi-node) into the current project. Thresholds, intervals and Discord are in `/plugin` → pace-line → configure.
+`/jobs init` copies `jobkit.py` (log_metrics, save_checkpoint, latest_checkpoint, load_resume, and `notify` for a discord-drop card from inside the job, with `repro_card`'s commit, seed, checkpoint and command) and `slurm/train.template.sbatch` (torchrun, multi-GPU and multi-node; a failure sends its card through `notify_exit` even when no Claude session is watching) into the current project. `python3 -I tests/test_jobkit.py` tests the cards against a local fake webhook. Thresholds, intervals and Discord are in `/plugin` → pace-line → configure.
 
 The watcher runs inside a Claude Code session: with no session open, nothing is polled or resubmitted.
 
