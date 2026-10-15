@@ -1,0 +1,52 @@
+{
+  "name": "discord-drop",
+  "version": "0.1.0",
+  "description": "Discord cards through a webhook, only when you're away: results with plots, finished tasks, failed jobs, questions waiting for you. Silent while you work with Claude.",
+  "author": {
+    "name": "Dídac"
+  },
+  "userConfig": {
+    "awayMinutes": {
+      "type": "number",
+      "title": "Away after (min)",
+      "description": "Minutes without a message from you to this session before Claude's cards reach Discord. Until then nothing is sent unless you ask.",
+      "required": false,
+      "default": 30
+    },
+    "needsYouMinutes": {
+      "type": "number",
+      "title": "Waiting on you (min)",
+      "description": "A permission prompt or a question left unanswered this long is sent to Discord.",
+      "required": false,
+      "default": 5
+    },
+    "safetyNet": {
+      "type": "boolean",
+      "title": "Safety net",
+      "description": "When a long stretch of work ends while you're away and Claude sent nothing, send a short 'done' card.",
+      "required": false,
+      "default": true
+    },
+    "sessionEndMinutes": {
+      "type": "number",
+      "title": "Hand-off before the allocation ends (min)",
+      "description": "Inside a Slurm job, this long before it ends Claude sends where it left off (only when you're away).",
+      "required": false,
+      "default": 30
+    },
+    "purgeWarnDays": {
+      "type": "number",
+      "title": "Scratch purge warning (days)",
+      "description": "Days before the monthly /scratch purge (first Tuesday) to send your scratch usage. 0 turns it off.",
+      "required": false,
+      "default": 3
+    },
+    "language": {
+      "type": "string",
+      "title": "Card language",
+      "description": "Language of the cards the mod writes itself: es or en.",
+      "required": false,
+      "default": "es"
+    }
+  }
+}

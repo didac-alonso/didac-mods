@@ -139,7 +139,7 @@ export type BatchJob = {
 
 export type Disk = { mount: string; size: number; used: number; avail: number }
 
-export type AlertKind = 'ended' | 'oom' | 'traceback' | 'nccl' | 'nonFinite' | 'silent' | 'idle' | 'pending' | 'nearLimit' | 'staleCkpt' | 'resumed' | 'resumeStopped'
+export type AlertKind = 'ended' | 'oom' | 'traceback' | 'nccl' | 'nonFinite' | 'silent' | 'idle' | 'pending' | 'nearLimit' | 'staleCkpt' | 'resumed' | 'resumeStopped' | 'started'
 
 export type Alert = { job: string; kind: AlertKind; level: 'info' | 'warn' | 'error'; text: string; at: number }
 

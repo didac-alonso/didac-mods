@@ -24,6 +24,11 @@
       "name": "plan-line",
       "source": "./plugins/plan-line",
       "description": "Live plan progress bars right above the prompt, with agent strips and sounds; a working fork of plan-progress."
+    },
+    {
+      "name": "discord-drop",
+      "source": "./plugins/discord-drop",
+      "description": "Discord cards through a webhook, only when you're away: results with plots, finished tasks, failed jobs, questions waiting for you."
     }
   ]
 }

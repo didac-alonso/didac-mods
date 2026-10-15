@@ -1,6 +1,6 @@
 {
   "name": "pace-line",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Coloured usage band above the prompt (model, folder, branch, context, cost, time, 5h/7d pace) plus a Slurm batch-job watcher: progress, live loss charts, GPUs, checkpoints, alerts and auto-resume.",
   "types": "./types/index.d.ts",
   "author": {
@@ -55,6 +55,13 @@
       "description": "Alert when a job has been pending this long.",
       "required": false,
       "default": 120
+    },
+    "startedAfterMinutes": {
+      "type": "number",
+      "title": "Started after a queue (min)",
+      "description": "A job that waited at least this long in the queue says when it starts.",
+      "required": false,
+      "default": 30
     },
     "maxResumes": {
       "type": "number",

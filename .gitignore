@@ -5,3 +5,4 @@ node_modules/
 plugins/*/tests/register.mjs
 plugins/*/tests/register.results.json
 plugins/*/tests/look.html
+__pycache__/

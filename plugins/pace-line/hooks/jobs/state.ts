@@ -27,6 +27,7 @@ export function configFrom(options: Readonly<Record<string, unknown>>): WatchCon
     nearLimitMinutes: num('nearLimitMinutes', DEFAULT_THRESHOLDS.nearLimitMinutes),
     staleCkptMinutes: num('staleCkptMinutes', DEFAULT_THRESHOLDS.staleCkptMinutes),
     pendingMinutes: num('pendingMinutes', DEFAULT_THRESHOLDS.pendingMinutes),
+    startedAfterMinutes: num('startedAfterMinutes', DEFAULT_THRESHOLDS.startedAfterMinutes),
     maxResumes: num('maxResumes', 3),
     excludeNames: (str('excludeNames') || 'dev-shell,interactive').split(',').map(s => s.trim()).filter(Boolean),
     discordChatId: str('discordChatId'),
@@ -42,7 +43,8 @@ Write training and eval jobs to its conventions, in any project:
 - Metrics: one JSON line per logging step in \`runs/$SLURM_JOB_ID/metrics.jsonl\`: \`{"time": <unix s>, "step": N, "total_steps": T, "epoch": E, "total_epochs": TE, "loss": ..., "val_<name>": ..., "lr": ..., "samples_per_s": ...}\`, rank 0 only.
 - Checkpoints: \`runs/$SLURM_JOB_ID/checkpoints/\`, named with the step or epoch (\`epoch=3-step=1200.pt\`, \`checkpoint-1200/\`), written atomically.
 - Resume: training resumes from the checkpoint path in \`$RESUME\` when set. pace-line resubmits a job that hits TIMEOUT with \`RESUME=<latest checkpoint>\` added to its --export, up to its limit (3 by default).
-- \`jobkit.py\` (log_metrics, save_checkpoint, latest_checkpoint, resume_path, load_resume) and \`slurm/train.template.sbatch\` implement this; \`/jobs init\` copies them into a project.`
+- \`jobkit.py\` (log_metrics, save_checkpoint, latest_checkpoint, resume_path, load_resume) and \`slurm/train.template.sbatch\` implement this; \`/jobs init\` copies them into a project.
+- Results: end train/eval scripts with \`jobkit.notify(title, text, fields=[(name, value)], image=plot)\` (a Discord card through discord-drop, held while the user is at a Claude session; it adds the commit, seed, checkpoint and command). The template's EXIT trap sends failures.`
 
 /** What /jobs init copies from the plugin into a project. */
 export const TEMPLATES = [

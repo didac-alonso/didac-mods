@@ -23,6 +23,13 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p "runs/$SLURM_JOB_ID"
 
+# A failure reaches Discord even with no Claude session watching: jobkit.notify_exit
+# sends discord-drop's card (held while you're at a Claude session; TIMEOUT and
+# scancel are left to pace-line). jobkit is standard library only, so the system
+# python3 runs it even when the environment is what broke. Results: call
+# jobkit.notify(...) at the end of train.py.
+trap 'code=$?; python3 -c "import sys; sys.path.insert(0, \".\"); import jobkit; jobkit.notify_exit($code)" || true' EXIT
+
 uv sync --frozen
 
 GPUS_PER_NODE=$(nvidia-smi -L | wc -l)
