@@ -19,6 +19,9 @@ const MONTHS: Record<Lang, string[]> = {
   en: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
 }
 const KEEP_SESSIONS = 30
+// turns the safety net speaks for: the user's own, and background work they started finishing; not
+// another plugin's message (a pace-line alert already has its card)
+const NET_ORIGINS = new Set(['composer', 'bridge', 'task-notification', 'auto-continuation'])
 
 const rules = (awayMinutes: number) => `# Discord cards (discord-drop)
 The user reads Discord on their phone. A card reaches them only when they're away (no message from them to this session for ${awayMinutes} min) or when they asked for one; while they're working with you nothing is sent. Send a card with ${TOOL}; it runs nothing and needs no permission. The mod answers "sent", "progress updated", or "held" (they're here: don't mention it).
@@ -95,6 +98,7 @@ const st = {
   handoffAskedAt: 0,
 }
 let hasToldRules = false
+let turnOrigin = ''
 let lastAssistant = ''
 let waiting: { timer: Timer; tool: string } | null = null
 
@@ -310,14 +314,18 @@ async function toPng($: EngineInterface, svg: string, base: string): Promise<str
   }
 }
 
+/** pace-line's jobs and alerts in this session, or undefined (not installed, not on a cluster). */
+async function paceJobs($: EngineInterface): Promise<PaceJobs | undefined> {
+  try {
+    return ((await $.state.get({ plugin: 'pace-line', key: 'jobs' } as never)) as { value?: unknown } | undefined)?.value as PaceJobs | undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** pace-line's new alerts, as cards, when nobody is at a terminal. */
 async function bridge($: EngineInterface): Promise<void> {
-  let jobs: PaceJobs | undefined
-  try {
-    jobs = ((await $.state.get({ plugin: 'pace-line', key: 'jobs' } as never)) as { value?: unknown } | undefined)?.value as PaceJobs | undefined
-  } catch {
-    return
-  }
+  const jobs = await paceJobs($)
   const fresh = (jobs?.alerts ?? []).filter(a => a.at > st.bridgeAfter).sort((a, b) => a.at - b.at)
   if (!jobs || !fresh.length) return
   st.bridgeAfter = fresh[fresh.length - 1]!.at
@@ -404,12 +412,14 @@ async function status($: EngineInterface): Promise<string> {
     ? 'no message from you yet in this session (counts as away)'
     : `${isAway(st.lastUserAt, now, cfg.awayMinutes) ? 'away' : 'here'}: your last message was ${fmtDur((now - st.lastUserAt) / 1000)} ago`
   const p = nextPurge(now, env.tzMinutes)
+  const jobs = await paceJobs($)
   return [
     'discord-drop',
     `· webhook: ${url}`,
     `· you: ${you}`,
     `· cards reach Discord after ${cfg.awayMinutes} min away; a question or permission prompt after ${cfg.needsYouMinutes} min`,
     env.endsAt !== null ? `· this allocation ends in ${fmtDur((env.endsAt - now) / 1000)}; hand-off ${cfg.sessionEndMinutes} min before` : '· not inside a Slurm allocation',
+    jobs ? `· pace-line: ${jobs.jobs.length} batch job${jobs.jobs.length === 1 ? '' : 's'} watched; their alerts become cards while you're away` : '· pace-line: not watching jobs in this session (no alerts to forward)',
     cfg.purgeWarnDays ? `· next /scratch purge: ${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')} (in ${p.daysLeft} d)` : '· purge warning off',
     '/drop test sends a sample card.',
   ].join('\n')
@@ -504,6 +514,7 @@ export const register: Register = (on, options) => {
   // the system-prompt route does not reach the model on every host
   on('prompt.submit', async ($, e, next) => {
     const kind = e.origin.kind
+    turnOrigin = kind
     if (kind === 'composer' || kind === 'bridge') await heard($)
     if (hasToldRules || (kind !== 'composer' && kind !== 'bridge' && kind !== 'sdk')) return next(e)
     hasToldRules = true
@@ -564,7 +575,7 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (e.agent_id) return result
     if (e.last_assistant_message) lastAssistant = e.last_assistant_message
-    if (!cfg.safetyNet || e.stop_hook_active || result.block || (e.background_tasks?.length ?? 0) > 0) return result
+    if (!cfg.safetyNet || e.stop_hook_active || result.block || (e.background_tasks?.length ?? 0) > 0 || !NET_ORIGINS.has(turnOrigin)) return result
     const since = st.lastUserAt
     if (since === null || st.safetyFired || st.lastSentAt >= since) return result
     const now = await $.clock.now()

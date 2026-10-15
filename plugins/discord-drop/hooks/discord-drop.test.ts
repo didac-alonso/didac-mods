@@ -308,6 +308,17 @@ test('the safety net sends one card when a long stretch ends unannounced', async
   expect(embed.description).toContain('abierto la PR')
 })
 
+test('no safety net for a turn another plugin started', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  await begin($)
+  await say($)
+  await clock.advance(40 * MIN)
+  await $.prompt.submit({ text: '[pace-line: batch-job alerts]', origin: { kind: 'unclassified' }, wait: false })
+  await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'The OOM is in the eval loop.', background_tasks: [] })
+  expect(w.curl).toHaveLength(0)
+})
+
 test('no safety net when Claude already sent the card', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = world(on)
