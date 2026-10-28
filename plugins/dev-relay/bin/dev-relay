@@ -661,6 +661,10 @@ def supervise_once(me: str, info: dict | None, last: dict) -> dict:
     asked = flag(f"now-{me}").exists()
     end = (info or {}).get("end")
     succ = successor_of(me, jobs) if jobs is not None else (last.get("successor") or None)
+    if jobs is not None and not succ and last.get("successor"):
+        # the one submitted before, though its comment is gone (an scontrol update on this
+        # cluster rewrites it): still queued or running, it is still the successor
+        succ = next((j for j in jobs if j["job"] == last["successor"].get("job")), None)
     if off and succ and succ["state"] == "PENDING":
         run(["scancel", succ["job"]], timeout=30, env=clean_env())
         log(f"relaying is off: cancelled the queued successor {succ['job']}")

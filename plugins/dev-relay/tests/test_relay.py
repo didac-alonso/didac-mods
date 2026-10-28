@@ -293,6 +293,15 @@ class SuperviseTest(Base):
         self.mod.supervise_once("100", self.info, st)
         self.assertEqual(len([a for a in self.w.ran if a[0] == "sbatch"]), 1)
 
+    def test_a_successor_that_lost_its_comment_is_still_the_successor(self):
+        self.w.t = self.end - 119 * 60
+        st = self.mod.supervise_once("100", self.info, {})
+        jid = st["successor"]["job"]
+        self.w.jobs[jid]["comment"] = "***TEST_COMMENT***"      # what an scontrol update leaves here
+        st = self.mod.supervise_once("100", self.info, st)
+        self.assertEqual(st["successor"]["job"], jid)
+        self.assertEqual(len([a for a in self.w.ran if a[0] == "sbatch"]), 1)
+
     def test_off_holds_and_cancels(self):
         self.w.t = self.end - 60 * 60
         (self.config / "off").touch()
