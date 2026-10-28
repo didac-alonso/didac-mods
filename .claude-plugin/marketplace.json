@@ -29,6 +29,11 @@
       "name": "discord-drop",
       "source": "./plugins/discord-drop",
       "description": "Discord cards through a webhook, only when you're away: results with plots, finished tasks, failed jobs, questions waiting for you."
+    },
+    {
+      "name": "dev-relay",
+      "source": "./plugins/dev-relay",
+      "description": "Keeps the dev-shell alive past Slurm's time limit: a successor job takes over and every Claude session resumes there, carrying on with what it was doing."
     }
   ]
 }

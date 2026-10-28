@@ -1,6 +1,6 @@
 {
   "name": "discord-drop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Discord cards through a webhook, only when you're away: results with plots, finished tasks, failed jobs, questions waiting for you. Silent while you work with Claude.",
   "author": {
     "name": "Dídac"

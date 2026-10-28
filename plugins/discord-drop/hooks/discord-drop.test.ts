@@ -5,7 +5,7 @@ import type { Engine } from 'claude-code/testing'
 import { alertDrop, lossChart } from './bridge'
 import type { PaceJob } from './bridge'
 import { chartSvg } from './chart'
-import { dropFrom, fmtDur, isAway, latestUserAt, nextPurge, opFrom, presenceWith, routeFor } from './drop'
+import { adoptedSuccessor, dropFrom, fmtDur, isAway, latestUserAt, nextPurge, opFrom, presenceWith, relayArmed, routeFor, successorAlive } from './drop'
 import type { Drop } from './drop'
 import { attachments, card, COLOR, curlConfig, parseCurl, payload, postArgv, progressBar, SILENT } from './embed'
 
@@ -177,10 +177,10 @@ describe('pace-line alerts', () => {
 
 // ── Engine: the mod against a mocked Discord ──────────────────────────
 
-type World = { curl: { argv: string[]; stdin: string }[]; files: Record<string, string>; contexts: (readonly string[] | undefined)[] }
+type World = { curl: { argv: string[]; stdin: string }[]; files: Record<string, string>; contexts: (readonly string[] | undefined)[]; asked: string[]; squeue: Record<string, string> }
 
 function world(on: On, env: Record<string, string> = {}): World {
-  const w: World = { curl: [], files: {}, contexts: [] }
+  const w: World = { curl: [], files: {}, contexts: [], asked: [], squeue: {} }
   const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   mock.store(on)
   mock.env(on, { HOME: '/home/demo', USER: 'demo', SLURMD_NODENAME: 'c0629', DISCORD_WEBHOOK_URL: SECRET, ...env })
@@ -195,6 +195,7 @@ function world(on: On, env: Record<string, string> = {}): World {
       return ok(`{"id":"m${w.curl.length}"}\n200`)
     }
     if (a[0] === 'date') return ok('-0400\n')
+    if (a[0] === 'squeue') return ok(w.squeue[a[a.indexOf('-j') + 1]!] ?? '')
     if (a[0] === 'rsvg-convert') w.files[a[a.indexOf('-o') + 1]!] = 'png'
     return ok('')
   })
@@ -207,6 +208,7 @@ function world(on: On, env: Record<string, string> = {}): World {
   on('fs.stat', (_$, e) => (e.path in w.files ? { value: { kind: 'file' as const, size: w.files[e.path]!.length, mtimeMs: NOW, isLink: false } } : { deny: 'missing' }))
   on('prompt.submit', (_$, e) => {
     w.contexts.push(e.context)
+    if (e.origin.kind === 'plugin') w.asked.push(e.text)
     return { text: e.text }
   })
   on('classic.Stop', () => ({}))
@@ -397,4 +399,57 @@ test('a job that reported itself is not repeated', async ($, on) => {
   await begin($)
   await clock.advance(16_000)
   expect(w.curl).toHaveLength(0)
+})
+
+describe('dev-relay', () => {
+  test('armed while a successor is lined up and the supervisor writes', () => {
+    const at = NOW / 1000
+    expect(relayArmed({ phase: 'ready', updatedAt: at - 60 }, NOW)).toBe(true)
+    expect(relayArmed({ phase: 'queued', updatedAt: at }, NOW)).toBe(true)
+    expect(relayArmed({ phase: 'running', updatedAt: at }, NOW)).toBe(false)
+    expect(relayArmed({ phase: 'off', updatedAt: at }, NOW)).toBe(false)
+    expect(relayArmed({ phase: 'ready', updatedAt: at - 11 * 60 }, NOW)).toBe(false)
+    expect(relayArmed({ phase: 'queued', updatedAt: at - 20 * 3600, adopted: true }, NOW)).toBe(true)
+    expect(relayArmed(null, NOW)).toBe(false)
+  })
+
+  test('an adopted job names its successor for squeue', () => {
+    expect(adoptedSuccessor({ adopted: true, successor: { job: '11445297' } })).toBe('11445297')
+    expect(adoptedSuccessor({ successor: { job: '11445297' } })).toBeNull()
+    expect(adoptedSuccessor({ adopted: true, successor: null })).toBeNull()
+    expect(successorAlive('PENDING\n')).toBe(true)
+    expect(successorAlive('RUNNING')).toBe(true)
+    expect(successorAlive('CANCELLED')).toBe(false)
+    expect(successorAlive('')).toBe(false)
+  })
+})
+
+const ENDING = { SLURM_JOB_ID: '100', SLURM_JOB_END_TIME: String(NOW / 1000 + 20 * 60) }
+
+test('a relayed allocation is not handed off; an ordinary one is', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, ENDING)
+  w.files['/home/demo/.local/state/dev-relay/jobs/100.json'] = JSON.stringify({ phase: 'ready', updatedAt: NOW / 1000 + 3600 })
+  await begin($)
+  await clock.advance(2 * MIN)
+  expect(w.asked.filter(t => t.includes('this allocation'))).toHaveLength(0)
+
+  w.files['/home/demo/.local/state/dev-relay/jobs/100.json'] = JSON.stringify({ phase: 'off', updatedAt: NOW / 1000 + 3600 })
+  await clock.advance(2 * MIN)
+  expect(w.asked.filter(t => t.includes('this allocation (Slurm job 100)'))).toHaveLength(1)
+})
+
+test('an adopted relay holds the hand-off while squeue still has the successor', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, ENDING)
+  // adopted: nobody rewrites the file, so its age says nothing
+  w.files['/home/demo/.local/state/dev-relay/jobs/100.json'] = JSON.stringify({ phase: 'queued', adopted: true, updatedAt: NOW / 1000 - 20 * 3600, successor: { job: '501' } })
+  w.squeue['501'] = 'PENDING\n'
+  await begin($)
+  await clock.advance(2 * MIN)
+  expect(w.asked.filter(t => t.includes('this allocation'))).toHaveLength(0)
+
+  delete w.squeue['501'] // cancelled before it ever ran
+  await clock.advance(2 * MIN)
+  expect(w.asked.filter(t => t.includes('this allocation (Slurm job 100)'))).toHaveLength(1)
 })
