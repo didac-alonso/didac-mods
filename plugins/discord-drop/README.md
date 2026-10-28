@@ -8,7 +8,7 @@ Discord cards through a webhook, for when you're not at the terminal: results wi
 - **Progress cards.** A card with a `key` is edited in place as work advances (a bar and an ETA Discord counts down), without a sound. Its end is a new message that does notify.
 - **Safety net.** When a long stretch of work ends while you're away and Claude sent nothing, a short *done* card goes out, at most once per message of yours.
 - **Waiting on you.** A permission prompt, a question or a plan to approve left 5 minutes goes to Discord with the command or the options.
-- **Hand-off.** Inside a Slurm allocation, 30 minutes before it ends Claude is asked to send where it left off; 15 minutes before, the mod sends it itself if Claude didn't.
+- **Hand-off.** Inside a Slurm allocation, 30 minutes before it ends Claude is asked to send where it left off; 15 minutes before, the mod sends it itself if Claude didn't. Not while [dev-relay](../dev-relay) has a successor lined up (for a job it adopted, `squeue` must still list the successor): the session moves on its own.
 - **Batch jobs.** pace-line's alerts (finished, failed, OOM, NaN, idle GPU, near the limit, started after a long queue…) become cards, a finished job's with its loss chart. A job that reported itself with `jobkit.notify()` isn't repeated.
 - **Scratch purge.** Three days before the monthly `/scratch` purge (the first Tuesday), your usage there, folder by folder.
 

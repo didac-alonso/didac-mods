@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 import { alertDrop, lossChart } from './bridge'
 import type { PaceJob, PaceJobs } from './bridge'
 import { chartSvg, ema, PALETTE } from './chart'
-import { cut, dropFrom, fmtDur, isAway, latestUserAt, MAX_FILE_BYTES, nextPurge, OP_LINE, opFrom, presenceWith, routeFor, TOOL } from './drop'
+import { adoptedSuccessor, cut, dropFrom, fmtDur, isAway, latestUserAt, MAX_FILE_BYTES, nextPurge, OP_LINE, opFrom, presenceWith, relayArmed, routeFor, successorAlive, TOOL } from './drop'
 import type { Drop, Field, Kind, Route } from './drop'
 import { attachments, baseOf, card, curlConfig, failure, messageUrl, parseCurl, patchArgv, payload, postArgv, postUrl, STRINGS, tookField } from './embed'
 import type { Lang, Strings } from './embed'
@@ -85,6 +85,8 @@ const env = {
   url: null as string | null,
   ownJob: null as string | null,
   endsAt: null as number | null,
+  /** dev-relay's state for this job, when the dev-shell relays itself */
+  relayFile: '',
   tzMinutes: 0,
 }
 
@@ -344,6 +346,22 @@ async function bridge($: EngineInterface): Promise<void> {
   await persist($)
 }
 
+/** dev-relay is moving this session to a new job: nothing to hand off while that holds. */
+async function relayMoves($: EngineInterface, now: number): Promise<boolean> {
+  if (!env.relayFile) return false
+  const state = await readJson($, env.relayFile)
+  if (!relayArmed(state, now)) return false
+  const succ = adoptedSuccessor(state)
+  if (!succ) return true
+  try {
+    const r = await $.process.run(['squeue', '-h', '-j', succ, '-o', '%T'], { timeoutMs: 60_000 })
+    return r.exitCode === 0 && successorAlive(r.stdout)
+  } catch {
+    // Slurm did not answer: the hand-off goes, a false alarm costs less than silence
+    return false
+  }
+}
+
 /** Before the allocation ends: Claude hands off, or the mod does. */
 async function watchEnd($: EngineInterface): Promise<void> {
   if (env.endsAt === null || st.handoff === 'done' || !cfg.sessionEndMinutes) return
@@ -358,6 +376,8 @@ async function watchEnd($: EngineInterface): Promise<void> {
       await persist($)
       return
     }
+    // checked again each minute: if the relay falls through, the hand-off still goes
+    if (await relayMoves($, now)) return
     st.handoff = 'asked'
     st.handoffAskedAt = now
     await persist($)
@@ -369,6 +389,7 @@ async function watchEnd($: EngineInterface): Promise<void> {
     return
   }
   if (st.handoff === 'asked' && left <= window / 2) {
+    if (await relayMoves($, now)) return
     st.handoff = 'done'
     await persist($)
     if (st.lastSentAt >= st.handoffAskedAt) return
@@ -451,6 +472,7 @@ async function start($: EngineInterface, cwd: string): Promise<void> {
   env.ownJob = (await $.env.get('SLURM_JOB_ID')) ?? null
   const end = Number(await $.env.get('SLURM_JOB_END_TIME'))
   env.endsAt = Number.isFinite(end) && end > 0 ? end * 1000 : null
+  env.relayFile = home && env.ownJob ? `${home}/.local/state/dev-relay/jobs/${env.ownJob}.json` : ''
   env.sessionId = await $.session.id()
   env.project = cwd.split('/').filter(Boolean).pop() ?? null
   env.dir = home ? `${home}/.claude/discord-drop` : ''

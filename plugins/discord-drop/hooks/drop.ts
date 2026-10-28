@@ -177,3 +177,29 @@ export function nextPurge(now: number, offsetMinutes: number): { year: number; m
   const d = new Date(t)
   return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate(), daysLeft: Math.round((t - today) / 86_400_000) }
 }
+
+/**
+ * dev-relay's state for this job (~/.local/state/dev-relay/jobs/<job>.json): true while
+ * a successor is lined up or the move is on, and the supervisor still writes. Then the
+ * session moves on its own and there is nothing to hand off. An adopted job (started
+ * before dev-relay) has no supervisor; `adoptedSuccessor` names the job to ask Slurm about.
+ */
+export function relayArmed(state: unknown, now: number): boolean {
+  if (!state || typeof state !== 'object') return false
+  const s = state as Record<string, unknown>
+  const at = typeof s.updatedAt === 'number' ? s.updatedAt * 1000 : 0
+  return ['queued', 'ready', 'moving'].includes(String(s.phase)) && (s.adopted === true || now - at < 10 * 60_000)
+}
+
+/** The successor of an adopted job: nobody watches it, so squeue has to say it still lives. */
+export function adoptedSuccessor(state: unknown): string | null {
+  if (!state || typeof state !== 'object') return null
+  const s = state as Record<string, unknown>
+  const succ = s.successor && typeof s.successor === 'object' ? (s.successor as Record<string, unknown>).job : null
+  return s.adopted === true && typeof succ === 'string' && /^\d+$/.test(succ) ? succ : null
+}
+
+/** `squeue -h -j <job> -o %T` for a successor that can still take over. */
+export function successorAlive(state: string): boolean {
+  return ['PENDING', 'CONFIGURING', 'RUNNING'].includes(state.trim())
+}
