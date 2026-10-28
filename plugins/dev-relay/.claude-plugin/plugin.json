@@ -1,0 +1,8 @@
+{
+  "name": "dev-relay",
+  "version": "0.1.0",
+  "description": "Keeps the dev-shell alive past Slurm's time limit: a successor job takes over, every Claude session resumes in its herdr pane, and the ones that were working carry on.",
+  "author": {
+    "name": "Dídac"
+  }
+}

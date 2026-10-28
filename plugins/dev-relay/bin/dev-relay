@@ -1,0 +1,986 @@
+#!/usr/bin/env python3
+"""dev-relay: the dev-shell outlives Slurm's time limit.
+
+Before the job ends, it submits its successor. The successor waits for a
+quiet moment (or the deadline), stops the old herdr server, starts its own,
+resumes every Claude session in the same pane, tells the ones that were
+working to carry on, and cancels the old job.
+
+    dev-relay run           the dev-shell batch script's last line: takeover, herdr, supervise
+    dev-relay current       the job whose herdr server is the live one (dev, dev-node, dev-sshd);
+                            --node prints its node, --wait S waits for a move or a queued job
+    dev-relay ensure        the same, submitting a dev-shell first when there is none
+    dev-relay status        where things stand (--json for the mod)
+    dev-relay now|off|on    move now · stop relaying (cancels a queued successor) · relay again
+    dev-relay adopt <job>   a dev-shell started before dev-relay: its successor goes in now,
+                            held (--begin) until LEAD before the end; no process needed there
+    dev-relay supervise     the supervisor alone
+
+State (one writer per file), under ~/.local/state/dev-relay:
+    active                  id of the job that holds the live herdr server
+    jobs/<job>.json         that job's supervisor: phase, successor, times, its Claude sessions
+    relays/<job>.json       that job's takeover: where it came from, what it resumed
+    claims/<job>-<session>  the session's dev-relay mod sent the carry-on prompt itself ("failed": it could not)
+Flags and settings, under ~/.config/dev-relay: off, now-<job>, config (KEY=VALUE lines).
+
+Standard library only; Python 3.9.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+
+HOME = Path.home()
+DEFAULTS = {
+    "LEAD": "240",          # minutes before the end: submit the successor (short can queue for hours)
+    "WINDOW": "60",         # minutes before the end: move once every Claude is idle
+    "FORCE": "10",          # minutes before the end: move anyway
+    "POLL": "30",           # seconds between supervisor and takeover checks
+    "GRACE": "180",         # seconds the mod gets to send the carry-on prompt itself
+    "FRESH": "20",          # minutes a session snapshot counts as "what it was doing"
+    "JOB_NAME": "dev-shell",
+    "SBATCH": str(HOME / "slurm" / "dev-shell.sbatch"),
+    "SBATCH_ARGS": "",      # extra sbatch flags for the successor (tests: --time=00:25:00)
+    "HERDR_SESSION": "",    # empty: herdr's default session
+    "CLAUDE_ARGS": "",      # extra flags for `claude --resume <id>` (shell words)
+    "CARD": "1",            # a Discord card after a move, while you're away
+    "STATE_DIR": str(HOME / ".local" / "state" / "dev-relay"),
+    "CONFIG_DIR": str(HOME / ".config" / "dev-relay"),
+}
+BUSY = ("working", "blocked")
+# COMPLETING is a job already being killed: never the live one, never one to take over
+LIVE = ("RUNNING",)
+# Variables a successor or a herdr server must not inherit: another Claude's
+# (CLAUDE_CODE_CHILD_SESSION turns transcripts off), the herdr pane or session
+# it was started from, or the submitting job's Slurm allocation. herdr's own
+# settings (HERDR_CONFIG_PATH, HERDR_HOME) stay.
+SCRUB = re.compile(r"^(CLAUDE|HERDR_(?!CONFIG_PATH$|HOME$)|SLURM_|SBATCH_|SRUN_|SALLOC_)")
+NAME_OK = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def load_cfg() -> dict[str, str]:
+    cfg = dict(DEFAULTS)
+    cdir = os.environ.get("DEV_RELAY_CONFIG_DIR", cfg["CONFIG_DIR"])
+    try:
+        for line in Path(cdir, "config").read_text().splitlines():
+            m = re.match(r"^\s*([A-Z_]+)\s*=\s*(.*?)\s*$", line)
+            if m and m.group(1) in cfg:
+                cfg[m.group(1)] = m.group(2).strip("'\"")
+    except OSError:
+        pass
+    for k in cfg:
+        if f"DEV_RELAY_{k}" in os.environ:
+            cfg[k] = os.environ[f"DEV_RELAY_{k}"]
+    cfg["CONFIG_DIR"] = cdir
+    return cfg
+
+
+CFG = load_cfg()
+
+
+def minutes(key: str) -> float:
+    return float(CFG[key]) * 60
+
+
+def state_dir() -> Path:
+    return Path(CFG["STATE_DIR"])
+
+
+def config_dir() -> Path:
+    return Path(CFG["CONFIG_DIR"])
+
+
+# ── seams the tests replace ──────────────────────────────────────────────────
+
+def now() -> float:
+    return time.time()
+
+
+def sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def run(argv: list[str], timeout: float = 60, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+
+
+def spawn_server(argv: list[str], env: dict[str, str]) -> None:
+    """The herdr server, detached; its log is herdr's own."""
+    subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def own_job() -> str | None:
+    return os.environ.get("SLURM_JOB_ID") or None
+
+
+def hostname() -> str:
+    return socket.gethostname().split(".")[0]
+
+
+# ── small helpers ────────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now())), f"dev-relay: {msg}", flush=True)
+
+
+def clean_env(keep_slurm: bool = False, **extra: str) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not SCRUB.match(k) or (keep_slurm and k.startswith("SLURM_"))}
+    env.update(extra)
+    return env
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        v = json.loads(path.read_text())
+        return v if isinstance(v, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=1) + "\n")
+    os.replace(tmp, path)
+
+
+def read_active() -> str | None:
+    try:
+        return (state_dir() / "active").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def write_active(job: str) -> None:
+    p = state_dir() / "active"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".active.{os.getpid()}")
+    tmp.write_text(job + "\n")
+    os.replace(tmp, p)
+
+
+def flag(name: str) -> Path:
+    return config_dir() / name
+
+
+def clock(ts: float | None) -> str:
+    return time.strftime("%d/%m %H:%M", time.localtime(ts)) if ts else "?"
+
+
+# ── Slurm ────────────────────────────────────────────────────────────────────
+
+FMT = "%i|%T|%N|%k|%S|%e"
+
+
+def slurm_time(text: str) -> float | None:
+    try:
+        return time.mktime(time.strptime(text.strip(), "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def parse_squeue(out: str) -> list[dict]:
+    jobs = []
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 6 or not parts[0]:
+            continue
+        jid, state, node, comment, start, end = parts
+        jobs.append({"job": jid, "state": state, "node": node if node and not node.startswith("(") else None,
+                     "comment": "" if comment == "(null)" else comment, "start": slurm_time(start), "end": slurm_time(end)})
+    return jobs
+
+
+def dev_jobs() -> list[dict] | None:
+    """This user's dev-shell jobs, newest start first; None when squeue failed."""
+    rc, out, _ = run(["squeue", "-u", os.environ.get("USER", ""), "-h", "-n", CFG["JOB_NAME"], "-o", FMT], timeout=120)
+    if rc != 0:
+        return None
+    return sorted(parse_squeue(out), key=lambda j: j["start"] or 0, reverse=True)
+
+
+def job_info(job: str) -> dict | None:
+    """The job as squeue sees it; None once it has left the queue."""
+    rc, out, _ = run(["squeue", "-h", "-j", job, "-o", FMT], timeout=120)
+    jobs = parse_squeue(out) if rc == 0 else []
+    return jobs[0] if jobs else None
+
+
+def is_live(info: dict | None) -> bool:
+    return bool(info) and info["state"] in LIVE
+
+
+def submit(prev: str | None) -> str | None:
+    argv = ["sbatch", "--parsable", f"--job-name={CFG['JOB_NAME']}", "--export=ALL"]
+    if prev:
+        argv.append(f"--comment=relay-of:{prev}")
+    argv += shlex.split(CFG["SBATCH_ARGS"]) + [CFG["SBATCH"]]
+    extra = {"DEV_RELAY_PREV": prev} if prev else {}
+    env = clean_env(**extra)
+    if not prev:
+        env.pop("DEV_RELAY_PREV", None)
+    # a busy slurmctld takes a while to answer an sbatch
+    rc, out, err = run(argv, timeout=300, env=env)
+    jid = out.strip().split(";")[0]
+    if rc != 0 or not jid.isdigit():
+        log(f"sbatch failed: {err.strip() or out.strip()}")
+        return None
+    return jid
+
+
+# ── herdr ────────────────────────────────────────────────────────────────────
+
+def herdr_argv(*args: str) -> list[str]:
+    s = CFG["HERDR_SESSION"]
+    return ["herdr", *(["--session", s] if s else []), *args]
+
+
+def in_job(job: str | None, argv: list[str]) -> list[str]:
+    """argv run inside another job's allocation (on its node), or here."""
+    if not job or job == own_job():
+        return argv
+    return ["srun", f"--jobid={job}", "--overlap", "--quiet", "-N1", "-n1", *argv]
+
+
+def herdr(*args: str, job: str | None = None, timeout: float = 60) -> dict | None:
+    rc, out, _ = run(in_job(job, herdr_argv(*args)), timeout=timeout, env=clean_env())
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out).get("result")
+    except (ValueError, AttributeError):
+        return None
+
+
+def claude_sessions(job: str | None = None) -> list[dict] | None:
+    """Every Claude herdr knows of, with the session it is in; None when herdr is unreachable."""
+    r = herdr("agent", "list", job=job)
+    if r is None:
+        return None
+    out = []
+    for a in r.get("agents", []):
+        sid = (a.get("agent_session") or {}).get("value")
+        if a.get("agent") != "claude" or not sid:
+            continue
+        out.append({"id": sid, "pane": a.get("pane_id"), "workspace": a.get("workspace_id"), "tab": a.get("tab_id"),
+                    "cwd": a.get("cwd"), "name": a.get("name"), "status": a.get("agent_status", "unknown")})
+    return out
+
+
+def busy_shells(job: str | None, sessions: list[dict]) -> list[dict]:
+    """Shell panes with a command in the foreground: the move cuts them."""
+    r = herdr("pane", "list", job=job) or {}
+    taken = {s["pane"] for s in sessions}
+    cut = []
+    for p in r.get("panes", []):
+        pid = p.get("pane_id")
+        if pid in taken:
+            continue
+        info = (herdr("pane", "process-info", "--pane", pid, job=job) or {}).get("process_info") or {}
+        if info.get("foreground_process_group_id") not in (None, info.get("shell_pid")):
+            cmds = [f.get("cmdline", "") for f in info.get("foreground_processes", [])]
+            cut.append({"pane": pid, "cwd": p.get("cwd"), "command": " | ".join(c for c in cmds if c)[:200]})
+    return cut
+
+
+def server_pattern() -> str:
+    s = CFG["HERDR_SESSION"]
+    return rf"(\S*/)?herdr {'--session ' + re.escape(s) + ' ' if s else ''}server"
+
+
+HEADER = re.compile(r"^\s*\[(\[)?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$")
+
+
+def server_config() -> Path:
+    """The herdr config a dev-relay server runs with: yours, with herdr's own resume
+    off, since dev-relay resumes the sessions itself (and only on the live node).
+    Rewritten on every supervisor poll, so `herdr server reload-config` sees your edits."""
+    src = Path(os.environ.get("HERDR_CONFIG_PATH") or HOME / ".config" / "herdr" / "config.toml")
+    try:
+        lines = src.read_text().splitlines()
+    except OSError:
+        lines = []
+    out, in_session, done = [], False, False
+    for line in lines:
+        head = HEADER.match(line)
+        if head:
+            if in_session and not done:
+                out.append("resume_agents_on_restore = false")
+                done = True
+            in_session = not head.group(1) and head.group(2) == "session"
+        elif in_session and re.match(r"^\s*resume_agents_on_restore\s*=", line):
+            continue
+        out.append(line)
+    if in_session and not done:
+        out.append("resume_agents_on_restore = false")
+        done = True
+    if not done:
+        out += ["", "[session]", "resume_agents_on_restore = false"]
+    dst = state_dir() / "herdr-config.toml"
+    text = "\n".join(out) + "\n"
+    try:
+        if dst.read_text() == text:
+            return dst
+    except OSError:
+        pass
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, dst)
+    return dst
+
+
+def start_server() -> bool:
+    spawn_server(herdr_argv("server"), clean_env(keep_slurm=True, HERDR_CONFIG_PATH=str(server_config())))
+    for _ in range(30):
+        if herdr("workspace", "list", timeout=10) is not None:
+            return True
+        sleep(1)
+    log("herdr server did not answer within 30 s")
+    return False
+
+
+def session_json_sessions() -> list[dict]:
+    """The Claude sessions herdr's own session.json remembers (last resort)."""
+    s = CFG["HERDR_SESSION"]
+    base = HOME / ".config" / "herdr"
+    data = read_json(base / "sessions" / s / "session.json" if s else base / "session.json") or {}
+    out = []
+    for w in data.get("workspaces", []):
+        nums = w.get("public_pane_numbers", {})
+        for t in w.get("tabs", []):
+            for local, p in (t.get("panes") or {}).items():
+                ref = p.get("agent_session") or {}
+                if ref.get("agent") == "claude" and ref.get("value"):
+                    out.append({"id": ref["value"], "pane": f"{w.get('id')}:p{nums.get(local, local)}", "workspace": w.get("id"),
+                                "tab": None, "cwd": p.get("cwd"), "name": p.get("agent_name"), "status": "unknown"})
+    return out
+
+
+# ── resuming ─────────────────────────────────────────────────────────────────
+
+def carry_on_prompt(s: dict, rel: dict) -> str:
+    frm, to = rel.get("from") or {}, rel
+    how = "in the middle of a turn" if s["status"] == "working" else "waiting on a question or a permission prompt"
+    return (f"[dev-relay: not typed by the user] The dev-shell reached its time limit, so this session moved from "
+            f"{frm.get('node') or '?'} (job {frm.get('job') or '?'}) to {to['node']} (job {to['job']}, ends {clock(to.get('endsAt'))}). "
+            f"It was {how} when it moved, so dev-relay pressed Esc: if your last tool call shows as interrupted or "
+            f"rejected, that was the move, not the user. Whatever ran on the old node is gone: background Bash, Monitors, "
+            f"subagents, /loop and scheduled wakeups. Carry on with what you were doing, redoing the step that was cut off; "
+            f"relaunch only what is still needed.")
+
+
+def shell_ready(pane: str) -> bool:
+    for _ in range(20):
+        info = (herdr("pane", "process-info", "--pane", pane) or {}).get("process_info") or {}
+        if info and info.get("foreground_process_group_id") == info.get("shell_pid"):
+            return True
+        sleep(1)
+    return False
+
+
+def pick_pane(s: dict, panes: list[dict], used: set[str]) -> str | None:
+    free = [p for p in panes if p.get("pane_id") not in used]
+    for p in free:
+        if p.get("pane_id") == s["pane"]:
+            return s["pane"]
+    for p in free:
+        if p.get("cwd") == s["cwd"] and p.get("workspace_id") == s["workspace"]:
+            return p["pane_id"]
+    workspaces = {p.get("workspace_id") for p in panes}
+    r = (herdr("tab", "create", "--workspace", s["workspace"], "--cwd", s["cwd"] or str(HOME), "--no-focus")
+         if s["workspace"] in workspaces else
+         herdr("workspace", "create", "--cwd", s["cwd"] or str(HOME), "--no-focus"))
+    return ((r or {}).get("root_pane") or {}).get("pane_id")
+
+
+def resume(sessions: list[dict]) -> None:
+    """Each session back in its pane (or one with its cwd, or a new tab), with `claude --resume`."""
+    running = {s["id"] for s in claude_sessions() or []}
+    panes = (herdr("pane", "list") or {}).get("panes", [])
+    with_agent = {p.get("pane_id") for p in panes if p.get("agent_status") not in (None, "unknown")}
+    used = set(with_agent)
+    for s in sessions:
+        if s["id"] in running:
+            s["resumed"] = "already running"
+            continue
+        pane = pick_pane(s, panes, used)
+        if not pane or not shell_ready(pane):
+            s["resumed"] = "no free pane"
+            log(f"could not place session {s['id']}")
+            continue
+        used.add(pane)
+        name = s["name"] if s.get("name") and NAME_OK.match(s["name"]) else f"relay-{re.sub(r'[^a-z0-9]', '', pane.split(':')[-1])}"
+        rc, out, err = run(herdr_argv("agent", "start", name, "--kind", "claude", "--pane", pane, "--timeout", "90000",
+                                      "--", "--resume", s["id"], *shlex.split(CFG["CLAUDE_ARGS"])), timeout=120, env=clean_env())
+        try:
+            res = json.loads(out or err or "{}")
+        except ValueError:
+            res = {}
+        code = (res.get("error") or {}).get("code")
+        s["pane"] = pane
+        s["resumed"] = "ok" if rc == 0 else (code or f"exit {rc}")
+        if not s.get("name"):
+            herdr("agent", "rename", pane, "--clear")
+        log(f"resumed {s['id']} in {pane}: {s['resumed']}")
+
+
+def carry_on(rel: dict, path: Path) -> None:
+    """The mod in each resumed session sends its own prompt; whoever it missed gets it from here."""
+    waiting = [s for s in rel["sessions"] if s.get("continue") == "pending"]
+    if not waiting:
+        return
+    deadline = now() + float(CFG["GRACE"])
+    claims = state_dir() / "claims"
+    while waiting and now() < deadline:
+        for s in list(waiting):
+            try:
+                said = (claims / f"{rel['job']}-{s['id']}").read_text().strip()
+            except OSError:
+                continue
+            if said != "failed":
+                s["continue"] = "mod"
+                waiting.remove(s)
+        if waiting:
+            sleep(5)
+    for s in waiting:
+        if s.get("resumed") != "ok":
+            s["continue"] = "skipped"
+            continue
+        r = herdr("agent", "prompt", s["pane"], s["prompt"], timeout=60)
+        s["continue"] = "herdr" if r is not None else "failed"
+        log(f"carry-on for {s['id']} via herdr: {s['continue']}")
+    write_json(path, rel)
+
+
+# ── Discord (discord-drop's webhook and away rule, as jobkit reads them) ──────
+
+DROP = HOME / ".claude" / "discord-drop"
+
+
+def webhook() -> str | None:
+    url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if url:
+        return url
+    try:
+        return (DROP / "webhook").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def user_here() -> bool:
+    try:
+        away = float(json.loads((DROP / "config.json").read_text()).get("awayMinutes", 30))
+    except (OSError, ValueError, AttributeError):
+        away = 30.0
+    try:
+        sessions = json.loads((DROP / "presence.json").read_text()).get("sessions", {})
+    except (OSError, ValueError, AttributeError):
+        return False
+    latest = max((s.get("lastUserAt", 0) for s in sessions.values() if isinstance(s, dict)), default=0)
+    return now() * 1000 - latest < away * 60_000
+
+
+def card(rel: dict) -> None:
+    if CFG["CARD"] != "1" or user_here():
+        return
+    hook = webhook()
+    if not hook:
+        return
+    ss = rel.get("sessions", [])
+    lines = [f"De {rel['from'].get('node') or '?'} (job {rel['from'].get('job')}) a **{rel['node']}** (job {rel['job']}), "
+             f"hasta el {clock(rel.get('endsAt'))}.",
+             f"{sum(s.get('resumed') == 'ok' for s in ss)}/{len(ss)} sesiones de Claude reanudadas; "
+             f"{sum(s.get('status') in BUSY for s in ss)} siguen con lo que hacían."]
+    if rel.get("forced"):
+        lines.append("El cambio fue forzado: alguna sesión estaba trabajando al llegar el límite.")
+    if rel.get("cut"):
+        lines.append("Cortados en el nodo viejo: " + "; ".join(f"`{c['command'][:80]}`" for c in rel["cut"][:5]))
+    if any(s.get("resumed") not in ("ok", "already running") for s in ss):
+        lines.append("Sin reanudar: " + ", ".join(f"`{s['id'][:8]}` ({s.get('resumed')})" for s in ss if s.get("resumed") not in ("ok", "already running")))
+    lines.append("Reconecta con `dev` o `ssh explorer-dev`.")
+    embed = {"color": 0x5865F2, "title": f"✔️ dev-shell renovado → {rel['node']}", "description": "\n".join(lines),
+             "footer": {"text": f"dev-relay · {rel['node']} · job {rel['job']}"},
+             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))}
+    body = json.dumps({"embeds": [embed], "allowed_mentions": {"parse": []}}).encode()
+    req = urllib.request.Request(re.sub(r"[?#].*$", "", hook).rstrip("/") + "?wait=true", data=body, method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "DiscordBot (https://github.com/didac-alonso/didac-mods, 1) dev-relay"})
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+    except OSError as e:
+        log(f"Discord card failed: {e}")
+
+
+# ── takeover: the successor's side ───────────────────────────────────────────
+
+def takeover(prev: str) -> str:
+    """'moved' once the sessions live here, 'gone' when prev ended first, 'off' when relaying was turned off."""
+    me = own_job() or "?"
+    path = state_dir() / "relays" / f"{me}.json"
+    rel = {"job": me, "node": hostname(), "from": {"job": prev}, "phase": "waiting", "startedAt": now()}
+    mine = job_info(me) if own_job() else None
+    rel["endsAt"] = mine["end"] if mine else None
+    write_json(path, rel)
+    log(f"successor of {prev}: waiting for the moment to move")
+    adopted = is_adopted(prev)
+    while True:
+        if flag("off").exists():
+            rel["phase"] = "off"
+            write_json(path, rel)
+            return "off"
+        info = job_info(prev)
+        if not is_live(info):
+            rel["phase"] = "gone"
+            write_json(path, rel)
+            log(f"{prev} already ended")
+            return "gone"
+        rel["from"]["node"] = info["node"]
+        end = info["end"] or now()
+        window_at, force_at = end - minutes("WINDOW"), end - minutes("FORCE")
+        if rel.get("windowAt") != window_at:
+            rel.update(windowAt=window_at, forceAt=force_at)
+            write_json(path, rel)
+        t = now()
+        asked = flag(f"now-{prev}").exists()
+        look = peek(prev) if asked or t >= window_at or adopted else None
+        mark_adopted(prev, "ready", rel, look)
+        if asked or t >= window_at:
+            busy = [s for s in (look or {}).get("sessions", []) if s["status"] in BUSY]
+            # no answer from there is not "everyone is idle": that waits for the deadline
+            if asked or t >= force_at or (look is not None and not busy):
+                move(prev, look, rel, path, forced=bool(busy) or look is None)
+                return "moved"
+        sleep(min(float(CFG["POLL"]), max(1.0, window_at - t) if t < window_at else float(CFG["POLL"])))
+
+
+def move(prev: str, look: dict | None, rel: dict, path: Path, forced: bool) -> None:
+    rel.update(phase="switching", switchAt=now(), forced=forced)
+    mark_adopted(prev, "moving", rel, look)
+    # herdr there did not answer: the supervisor's last look is all there is
+    sessions = look["sessions"] if look else recent_snapshot(prev) or []
+    rel["cut"] = look["cut"] if look else []
+    rel["sessions"] = [dict(s) for s in sessions]
+    write_json(path, rel)
+    log(f"moving {len(sessions)} Claude session(s) from {prev}{' (forced)' if forced else ''}")
+    # one srun: Esc to the busy ones, herdr stopped there, leftovers killed
+    busy = [s["pane"] for s in sessions if s["status"] in BUSY]
+    rc, out, err = run(in_job(prev, [sys.executable, str(Path(__file__).resolve()), "release", *busy]), timeout=180, env=clean_env())
+    if rc != 0:
+        log(f"release on {prev} failed: {(err or out).strip()[:200]}")
+    try:
+        flag(f"now-{prev}").unlink()
+    except OSError:
+        pass
+    # the old job goes before herdr starts here: whatever srun could not reach there
+    # (a second server, a Claude outside herdr) must not live on next to the new one
+    run(["scancel", prev], timeout=30, env=clean_env())
+    for _ in range(20):
+        info = job_info(prev)
+        if not info or info["state"] not in ("RUNNING", "CONFIGURING"):
+            break
+        sleep(3)
+    log(f"cancelled {prev}")
+    settle(rel, path)
+    carry_on(rel, path)
+    card(rel)
+    rel["phase"] = "done"
+    write_json(path, rel)
+
+
+def settle(rel: dict, path: Path) -> None:
+    """herdr up here, this job the live one, every session resumed."""
+    if not start_server():
+        rel["serverFailed"] = True
+    write_active(rel["job"])
+    for s in rel["sessions"]:
+        if s["status"] in BUSY:
+            s["continue"] = "pending"
+            s["prompt"] = carry_on_prompt(s, rel)
+    rel["phase"] = "resuming"
+    write_json(path, rel)
+    resume(rel["sessions"])
+    rel["phase"] = "resumed"
+    write_json(path, rel)
+
+
+def recent_snapshot(job: str | None) -> list[dict] | None:
+    """The sessions a job's supervisor last saw; their status only counts while fresh."""
+    j = read_json(state_dir() / "jobs" / f"{job}.json") if job else None
+    if not j or not isinstance(j.get("agents"), list):
+        return None
+    fresh = now() - float(j.get("agentsAt") or 0) <= minutes("FRESH")
+    return [{**s, "status": s.get("status") if fresh else "unknown"} for s in j["agents"] if s.get("id")]
+
+
+def fresh_start(prev: str | None) -> None:
+    """No live job to take over: herdr here, and the sessions the last one had."""
+    me = own_job() or "?"
+    path = state_dir() / "relays" / f"{me}.json"
+    last = prev or read_active()
+    sessions = recent_snapshot(last) or session_json_sessions()
+    seen = read_json(state_dir() / "jobs" / f"{last}.json") if last else None
+    rel = {"job": me, "node": hostname(), "from": {"job": last, "node": (seen or {}).get("node")},
+           "phase": "switching", "startedAt": now(), "switchAt": now(), "forced": False, "cut": [],
+           "sessions": [dict(s) for s in sessions], "endsAt": (job_info(me) or {}).get("end") if own_job() else None}
+    if not prev:
+        # a fresh dev-shell after a gap: resume, but nobody was mid-turn a moment ago
+        for s in rel["sessions"]:
+            s["status"] = "unknown"
+    write_json(path, rel)
+    settle(rel, path)
+    carry_on(rel, path)
+    rel["phase"] = "done"
+    write_json(path, rel)
+
+
+# ── supervise: the running job's side ────────────────────────────────────────
+
+def successor_of(job: str, jobs: list[dict]) -> dict | None:
+    return next((j for j in jobs if j["comment"] == f"relay-of:{job}"), None)
+
+
+def supervise_once(me: str, info: dict | None, last: dict) -> dict:
+    jobs = dev_jobs()
+    off = flag("off").exists()
+    asked = flag(f"now-{me}").exists()
+    end = (info or {}).get("end")
+    succ = successor_of(me, jobs) if jobs is not None else (last.get("successor") or None)
+    if off and succ and succ["state"] == "PENDING":
+        run(["scancel", succ["job"]], timeout=30, env=clean_env())
+        log(f"relaying is off: cancelled the queued successor {succ['job']}")
+        succ = None
+    submit_at = end - minutes("LEAD") if end else None
+    if jobs is not None and not off and not succ and (asked or (submit_at is not None and now() >= submit_at)):
+        jid = submit(me)
+        if jid:
+            log(f"submitted successor {jid}")
+            succ = {"job": jid, "state": "PENDING", "node": None}
+    rel = read_json(state_dir() / "relays" / f"{succ['job']}.json") if succ else None
+    if off:
+        phase = "off"
+    elif not succ:
+        phase = "running"
+    elif succ["state"] == "PENDING":
+        phase = "queued"
+    elif rel and rel.get("phase") in ("switching", "resuming", "resumed", "done"):
+        phase = "moving"
+    else:
+        phase = "ready"
+    sessions = claude_sessions()
+    misses = 0 if sessions is not None else int(last.get("serverMisses") or 0) + 1
+    if misses >= 2 and phase != "moving":
+        # herdr died under a running job (a crash, a stray stop): back up, sessions back in
+        log("herdr server gone: starting it again")
+        if start_server():
+            resume([dict(s, status="unknown") for s in last.get("agents") or []])
+            sessions = claude_sessions()
+        misses = 0
+    else:
+        server_config()
+    state = {
+        "job": me, "node": hostname(), "endsAt": end, "phase": phase,
+        "successor": {k: succ.get(k) for k in ("job", "state", "node")} if succ else None,
+        "submitAt": submit_at, "windowAt": end - minutes("WINDOW") if end else None, "forceAt": end - minutes("FORCE") if end else None,
+        "off": off, "now": asked, "updatedAt": now(),
+        "agents": sessions if sessions is not None else last.get("agents", []),
+        "agentsAt": now() if sessions is not None else last.get("agentsAt"),
+        "serverMisses": misses,
+    }
+    write_json(state_dir() / "jobs" / f"{me}.json", state)
+    return state
+
+
+def supervise() -> None:
+    me = own_job()
+    if not me:
+        sys.exit("dev-relay supervise: not inside a Slurm job")
+    act = read_active()
+    if not act or (act != me and not is_live(job_info(act))):
+        write_active(me)
+    log(f"supervising {me} (successor {CFG['LEAD']} min before the end)")
+    info, info_at, last = job_info(me), now(), {}
+    while True:
+        if now() - info_at > 300:
+            info, info_at = job_info(me) or info, now()
+        try:
+            last = supervise_once(me, info, last)
+        except Exception as e:  # the supervisor must outlive any one bad poll
+            log(f"poll failed: {e!r}")
+        sleep(float(CFG["POLL"]))
+
+
+def adopt(job: str) -> int:
+    """A job that runs no supervisor (an old batch script ending in `sleep infinity`):
+    the successor is queued now with --begin, and the state says so (adopted)."""
+    info = job_info(job)
+    if not is_live(info) or not info["end"]:
+        print(f"dev-relay adopt: {job} is not a running job with an end time", file=sys.stderr)
+        return 2
+    act = read_active()
+    if not act or (act != job and not is_live(job_info(act))):
+        write_active(job)
+    succ = successor_of(job, dev_jobs() or [])
+    if not succ:
+        begin = max(now(), info["end"] - minutes("LEAD"))
+        CFG["SBATCH_ARGS"] = f"{CFG['SBATCH_ARGS']} --begin={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(begin))}"
+        jid = submit(job)
+        if not jid:
+            return 1
+        succ = {"job": jid, "state": "PENDING", "node": None}
+        print(f"dev-relay: successor {jid} queued, held until {clock(begin)}")
+    else:
+        print(f"dev-relay: {job} already has successor {succ['job']}")
+    end = info["end"]
+    write_json(state_dir() / "jobs" / f"{job}.json", {
+        "job": job, "node": info["node"], "endsAt": end, "phase": "queued",
+        "successor": {k: succ.get(k) for k in ("job", "state", "node")},
+        "submitAt": end - minutes("LEAD"), "windowAt": end - minutes("WINDOW"), "forceAt": end - minutes("FORCE"),
+        "off": False, "now": False, "updatedAt": now(), "adopted": True, "agents": [], "agentsAt": None,
+    })
+    return 0
+
+
+def peek(job: str) -> dict | None:
+    """What the old job's herdr holds, in one srun: its Claude sessions and the shell panes busy with a command."""
+    rc, out, _ = run(in_job(job, [sys.executable, str(Path(__file__).resolve()), "peek"]), timeout=120, env=clean_env())
+    try:
+        look = json.loads(out) if rc == 0 else None
+    except ValueError:
+        look = None
+    return look if isinstance(look, dict) and isinstance(look.get("sessions"), list) else None
+
+
+def local_peek() -> int:
+    sessions = claude_sessions()
+    if sessions is None:
+        return 1
+    print(json.dumps({"sessions": sessions, "cut": busy_shells(None, sessions)}))
+    return 0
+
+
+def release(panes: list[str]) -> int:
+    """On the old node: Esc to the sessions that were busy, wait for them to stop
+    (a minute at most), stop herdr, kill whatever herdr server is left."""
+    for pane in panes:
+        herdr("agent", "send-keys", pane, "esc")
+    for _ in range(30):
+        left = claude_sessions()
+        if not left or not any(s["status"] == "working" for s in left):
+            break
+        sleep(2)
+    herdr("server", "stop", timeout=60)
+    sleep(2)
+    # whatever is left there (a second server, a bridge's) must not save over session.json
+    run(["pkill", "-KILL", "-u", os.environ.get("USER", ""), "-f", "-x", server_pattern()], timeout=30)
+    return 0
+
+
+def is_adopted(job: str) -> bool:
+    return bool((read_json(state_dir() / "jobs" / f"{job}.json") or {}).get("adopted"))
+
+
+def mark_adopted(prev: str, phase: str, rel: dict, look: dict | None) -> None:
+    """An adopted job has no supervisor of its own: its successor keeps its state current."""
+    path = state_dir() / "jobs" / f"{prev}.json"
+    j = read_json(path)
+    if not j or not j.get("adopted"):
+        return
+    j.update(phase=phase, updatedAt=now(), successor={"job": rel["job"], "state": "RUNNING", "node": rel["node"]})
+    if look is not None:
+        j.update(agents=look["sessions"], agentsAt=now())
+    write_json(path, j)
+
+
+def cmd_run() -> None:
+    me = own_job()
+    if not me:
+        sys.exit("dev-relay run: not inside a Slurm job")
+    state_dir().mkdir(parents=True, exist_ok=True)
+    prev = os.environ.get("DEV_RELAY_PREV") or None
+    if prev == me:
+        prev = None
+    if prev:
+        r = takeover(prev)
+        if r == "off":
+            log("relaying is off: this successor ends here")
+            run(["scancel", me], timeout=30, env=clean_env())
+            return
+        if r == "gone":
+            fresh_start(prev)
+    else:
+        act = read_active()
+        if act and act != me and is_live(job_info(act)):
+            log(f"{act} is already the live dev-shell; this one ends here")
+            run(["scancel", me], timeout=30, env=clean_env())
+            return
+        fresh_start(None)
+    supervise()
+
+
+# ── what dev, dev-node and dev-sshd ask ──────────────────────────────────────
+
+def moving_out_of(job: str) -> bool:
+    for p in (state_dir() / "relays").glob("*.json"):
+        r = read_json(p) or {}
+        if (r.get("from") or {}).get("job") == job and r.get("phase") in ("switching", "resuming"):
+            return True
+    return False
+
+
+def current(wait: float) -> str | None:
+    """The live job. While a move is under way, or a new job is still starting its
+    herdr server, it waits for the pointer (90 s at most); a queued dev-shell is
+    waited for up to `wait`."""
+    start = now()
+    while True:
+        jobs = dev_jobs() or []
+        live = [j for j in jobs if j["state"] in LIVE]
+        act = read_active()
+        t = now()
+        if act and any(j["job"] == act for j in live):
+            if not moving_out_of(act) or t - start >= min(wait, 180):
+                return act
+        elif live:
+            if t - start >= min(wait, 90):
+                return live[0]["job"]
+        elif t - start >= wait or not any(j["state"] == "PENDING" for j in jobs):
+            return None
+        sleep(3)
+
+
+@contextmanager
+def dir_lock(path: Path, stale: float = 600):
+    """mkdir is atomic on NFS, where $HOME lives (v3, no local locks: lockf can hang)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(900):
+        try:
+            path.mkdir()
+            break
+        except FileExistsError:
+            try:
+                if now() - path.stat().st_mtime > stale:
+                    path.rmdir()
+                    continue
+            except OSError:
+                pass
+            sleep(1)
+    try:
+        yield
+    finally:
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
+def ensure(wait: float) -> str | None:
+    # several clients connecting at once (VS Code opens a few) submit one job between them
+    with dir_lock(state_dir() / "ensure.lock.d"):
+        jid = current(0)
+        jobs = dev_jobs() or []
+        if not jid and not jobs:
+            jid = submit(None)
+            if not jid:
+                return None
+            print(f"submitted {jid}, waiting for a node...", file=sys.stderr)
+    return current(max(wait, 1800))
+
+
+def status_text(j: dict | None, rel: dict | None) -> str:
+    if not j:
+        return "dev-relay: no supervisor has written this job's state yet"
+    s = j.get("successor") or {}
+    left = (j.get("endsAt") or now()) - now()
+    lines = [f"dev-relay · job {j['job']} on {j['node']}, ends {clock(j.get('endsAt'))} ({left / 3600:.1f} h left)"]
+    lines.append({
+        "off": "relaying is off (dev-relay on to turn it back on)",
+        "running": f"successor goes in at {clock(j.get('submitAt'))}",
+        "queued": f"successor {s.get('job')} queued",
+        "ready": f"successor {s.get('job')} ready on {s.get('node')}: moves when every Claude is idle after {clock(j.get('windowAt'))}, by {clock(j.get('forceAt'))} at the latest",
+        "moving": f"moving to {s.get('node')} (job {s.get('job')}) now",
+    }.get(j.get("phase"), j.get("phase") or "?"))
+    lines.append(f"{len(j.get('agents') or [])} Claude session(s) here: " +
+                 ", ".join(f"{a['pane']} {a['status']}" for a in j.get("agents") or []))
+    if rel and rel.get("from", {}).get("job"):
+        lines.append(f"came from job {rel['from']['job']} ({rel['from'].get('node') or '?'}) at {clock(rel.get('switchAt'))}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[1] if len(argv) > 1 else "status"
+    wait = float(argv[argv.index("--wait") + 1]) if "--wait" in argv else 0.0
+    if cmd == "run":
+        cmd_run()
+    elif cmd == "supervise":
+        supervise()
+    elif cmd == "peek":
+        return local_peek()
+    elif cmd == "release":
+        return release(argv[2:])
+    elif cmd == "adopt":
+        if len(argv) < 3 or not argv[2].isdigit():
+            print("usage: dev-relay adopt <job>", file=sys.stderr)
+            return 2
+        return adopt(argv[2])
+    elif cmd in ("current", "ensure"):
+        jid = current(wait) if cmd == "current" else ensure(wait)
+        if not jid:
+            return 3
+        if "--node" in argv:
+            info = job_info(jid)
+            if not info or not info["node"]:
+                return 3
+            print(info["node"])
+        else:
+            print(jid)
+    elif cmd == "status":
+        jid = argv[2] if len(argv) > 2 and argv[2].isdigit() else own_job() or read_active()
+        j = read_json(state_dir() / "jobs" / f"{jid}.json") if jid else None
+        rel = read_json(state_dir() / "relays" / f"{jid}.json") if jid else None
+        print(json.dumps({"job": jid, "state": j, "relay": rel}) if "--json" in argv else status_text(j, rel))
+    elif cmd in ("now", "off", "on"):
+        config_dir().mkdir(parents=True, exist_ok=True)
+        if cmd == "on":
+            try:
+                flag("off").unlink()
+            except OSError:
+                pass
+            print("dev-relay: relaying on")
+        elif cmd == "off":
+            flag("off").touch()
+            jid = own_job() or read_active()
+            succ = successor_of(jid, dev_jobs() or []) if jid else None
+            if succ and succ["state"] == "PENDING":
+                run(["scancel", succ["job"]], timeout=30, env=clean_env())
+            print("dev-relay: relaying off" + (f"; cancelled the queued successor {succ['job']}" if succ and succ["state"] == "PENDING" else ""))
+        else:
+            jid = argv[2] if len(argv) > 2 and argv[2].isdigit() else own_job() or read_active()
+            if not jid:
+                print("dev-relay now: no dev-shell job to move from", file=sys.stderr)
+                return 2
+            flag(f"now-{jid}").touch()
+            print(f"dev-relay: {jid} moves as soon as its successor is running (submitting one if needed)")
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
