@@ -12,6 +12,13 @@ Keeps a dev-shell going past Slurm's time limit. A dev-shell is a herdr server i
 6. **Carrying on.** The sessions that were mid-turn, or waiting on a question, get a carry-on prompt. It says where they moved and that background work on the old node is gone. Each session's own mod sends it. If a session's mod hasn't claimed it within three minutes, herdr types it in.
 7. **Card.** A Discord card through discord-drop's webhook says where things went, but only if you've been away 30 minutes.
 
+Claude Code never saves the folder-trust answer for your home folder. So a session resumed in `~` stops at "Is this a project you created or one you trust?". dev-relay doesn't answer it for you:
+
+- **Card.** It sends a Discord card naming the session, its pane and folder, whether or not you're around, since only you can answer it.
+- **After you trust it.** The supervisor notices within its next poll. A session that was working then gets its carry-on prompt: from its own mod as Claude starts, or from herdr a minute later.
+- **If you choose "No, exit".** Nothing more is sent.
+- **Avoiding it.** Sessions started in a project folder never stop there, because Claude Code keeps the answer for those.
+
 If the successor only gets a node after the old job died, it still resumes every session. It uses the supervisor's last snapshot, or herdr's `session.json` if there is no snapshot. A fresh dev-shell started after a gap also resumes the sessions, but tells none of them to carry on.
 
 Inside Claude, the mod adds three things:

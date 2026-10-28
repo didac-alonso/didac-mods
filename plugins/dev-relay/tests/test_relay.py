@@ -48,6 +48,7 @@ class World:
         self.next_id = 500
         self.on_sleep = None  # scenario hook, called with the clock after each sleep
         self.where: list[str] = []  # the job an `srun dev-relay peek|release` is running in
+        self.trust: set[str] = set()  # panes where a resumed Claude stops at the folder-trust question
 
     # jobs and servers
     def job(self, jid: str, state="RUNNING", node="c0001", comment="", start=None, end=None):
@@ -58,7 +59,18 @@ class World:
         panes = panes if panes is not None else [{"pane_id": a["pane_id"], "workspace_id": a["pane_id"].split(":")[0],
                                                   "cwd": a.get("cwd", "/w"), "agent_status": a["agent_status"]} for a in agents]
         self.servers[jid] = {"up": up, "agents": agents, "panes": [dict(p) for p in panes], "stopped": False,
-                             "prompts": [], "keys": [], "started": []}
+                             "prompts": [], "keys": [], "started": [], "screens": {}}
+
+    def answer(self, pane: str, yes: bool):
+        """The person answers the folder-trust question in that pane of this job's herdr."""
+        s = self.servers[self.me]
+        s["screens"][pane] = "❯ "
+        if yes:
+            for a in s["agents"]:
+                if a["pane_id"] == pane:
+                    a["agent_status"] = "idle"
+        else:
+            s["agents"] = [a for a in s["agents"] if a["pane_id"] != pane]
 
     # the seams
     def now(self):
@@ -159,11 +171,22 @@ class World:
             pane = args[args.index("--pane") + 1]
             sid = args[args.index("--resume") + 1]
             s["started"].append((args[2], pane, sid))
-            s["agents"].append({"id": sid, "pane_id": pane, "agent_status": "idle"})
+            blocked = pane in self.trust
+            s["agents"].append({"id": sid, "pane_id": pane, "agent_status": "blocked" if blocked else "idle"})
             for p in s["panes"]:
                 if p["pane_id"] == pane:
                     p["agent_status"] = "idle"
+            if blocked:
+                s["screens"][pane] = " Quick safety check: Is this a project you created or one you trust?\n ❯ No, exit\n   Yes, I trust this folder\n"
+                return 1, "", '{"error":{"code":"agent_not_ready","message":"blocked during startup"}}'
             return ok({"agent": {}})
+        if args[:2] == ["agent", "read"]:
+            return 0, s["screens"].get(args[2], ""), ""
+        if args[:2] == ["agent", "get"]:
+            a = next((a for a in s["agents"] if a["pane_id"] == args[2]), None)
+            if not a:
+                return 1, "", '{"error":{"code":"agent_not_found"}}'
+            return ok({"agent": {"agent": "claude", "agent_status": a["agent_status"], "pane_id": a["pane_id"]}})
         if args[:2] == ["agent", "rename"]:
             return ok({})
         if args[:2] == ["agent", "prompt"]:
@@ -191,6 +214,8 @@ class Base(unittest.TestCase):
         self.mod.own_job = lambda: self.w.me
         self.mod.hostname = lambda: "cNEW"
         self.mod.log = lambda msg: None
+        self.cards: list[dict] = []
+        self.mod.post = self.cards.append
         self.state = root / "state"
         self.config = root / "config"
         self.config.mkdir()
@@ -507,6 +532,101 @@ class AdoptTest(Base):
         j = json.loads((self.state / "jobs" / "100.json").read_text())
         self.assertEqual(j["phase"], "moving")
         self.assertEqual(j["agents"][0]["id"], "s1")
+
+
+class TrustTest(Base):
+    """A resumed session stopped at "do you trust this folder?": the person answers, never dev-relay."""
+    me = "200"
+
+    def setUp(self):
+        super().setUp()
+        self.end = T0 + 3 * 3600
+        self.w.job("100", start=T0 - 45 * 3600, end=self.end, node="cOLD")
+        self.w.job("200", start=T0, end=T0 + 48 * 3600, node="cNEW", comment="relay-of:100")
+        self.mod.CFG["CARD"] = "1"
+        self.mod.user_here = lambda: True          # the trust card goes even so
+        self.w.trust.add("w8:p2")
+        self.w.server("100", agents=[{"id": "sess-busy-1", "pane_id": "w8:p2", "agent_status": "working", "cwd": str(self.mod.HOME)},
+                                     {"id": "sess-idle-2", "pane_id": "w8:p1", "agent_status": "idle", "cwd": "/projects/p"}])
+        (self.config / "now-100").touch()
+
+    def relay(self):
+        return json.loads((self.state / "relays" / "200.json").read_text())
+
+    def session(self, sid):
+        return next(s for s in self.relay()["sessions"] if s["id"] == sid)
+
+    def tend(self):
+        self.mod.supervise_once("200", self.mod.job_info("200"), {})
+
+    def test_stuck_session_waits_and_the_person_gets_a_card(self):
+        self.mod.takeover("100")
+        busy = self.session("sess-busy-1")
+        self.assertEqual(busy["resumed"], "trust")
+        self.assertEqual(busy["continue"], "pending")          # not sent into the question
+        self.assertEqual(self.session("sess-idle-2")["resumed"], "ok")
+        new = self.w.servers["200"]
+        self.assertEqual(new["keys"], [])                        # dev-relay answers nothing
+        self.assertEqual(new["prompts"], [])
+        trust = [c for c in self.cards if "confías" in c["title"]]
+        self.assertEqual(len(trust), 1)
+        self.assertIn("`w8:p2`", trust[0]["description"])
+        self.assertIn("`~`", trust[0]["description"])
+        self.assertIn("«sigue»", trust[0]["description"])
+        self.tend()                                              # still unanswered: nothing moves
+        self.assertEqual(self.session("sess-busy-1")["resumed"], "trust")
+
+    def test_carry_on_after_the_person_trusts_it(self):
+        self.mod.takeover("100")
+        self.w.answer("w8:p2", yes=True)
+        self.tend()
+        busy = self.session("sess-busy-1")
+        self.assertEqual(busy["resumed"], "ok")
+        self.assertEqual(busy["continue"], "pending")           # the mod's minute
+        self.w.t += self.mod.TRUST_GRACE + 1
+        self.tend()
+        self.assertEqual(self.session("sess-busy-1")["continue"], "herdr")
+        self.assertEqual([p for p, _ in self.w.servers["200"]["prompts"]], ["w8:p2"])
+
+    def test_the_mods_claim_wins_after_trust(self):
+        self.mod.takeover("100")
+        self.w.answer("w8:p2", yes=True)
+        (self.state / "claims").mkdir(exist_ok=True)
+        (self.state / "claims" / "200-sess-busy-1").write_text("sent\n")
+        self.tend()
+        self.w.t += self.mod.TRUST_GRACE + 1
+        self.tend()
+        self.assertEqual(self.session("sess-busy-1")["continue"], "mod")
+        self.assertEqual(self.w.servers["200"]["prompts"], [])
+
+    def test_no_exit_is_respected(self):
+        self.mod.takeover("100")
+        self.w.answer("w8:p2", yes=False)
+        self.tend()
+        busy = self.session("sess-busy-1")
+        self.assertEqual(busy["resumed"], "declined")
+        self.assertEqual(busy["continue"], "skipped")
+        self.w.t += 3600
+        self.tend()
+        self.assertEqual(self.w.servers["200"]["prompts"], [])
+
+    def test_an_idle_session_only_needs_the_answer(self):
+        self.w.trust = {"w8:p1"}
+        self.mod.takeover("100")
+        self.assertEqual(self.session("sess-idle-2")["resumed"], "trust")
+        self.w.answer("w8:p1", yes=True)
+        self.tend()
+        self.w.t += 3600
+        self.tend()
+        self.assertEqual(self.session("sess-idle-2")["resumed"], "ok")
+        self.assertNotIn("continue", self.session("sess-idle-2"))
+        self.assertEqual([p for p, _ in self.w.servers["200"]["prompts"]], ["w8:p2"])   # only the busy one, at once
+
+    def test_status_names_the_waiting_pane(self):
+        self.mod.takeover("100")
+        self.tend()
+        text = self.mod.status_text(json.loads((self.state / "jobs" / "200.json").read_text()), self.relay())
+        self.assertIn("waiting for you to trust their folder: sess-bus in pane w8:p2", text)
 
 
 class CurrentTest(Base):

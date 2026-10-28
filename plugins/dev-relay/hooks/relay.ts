@@ -18,7 +18,17 @@ export type JobState = {
   adopted: boolean
 }
 
-export type RelaySession = { id: string; pane: string; status: string; continue?: string; prompt?: string }
+export type RelaySession = {
+  id: string
+  pane: string
+  status: string
+  continue?: string
+  prompt?: string
+  /** 'trust': stopped at the folder-trust question, waiting for the person */
+  resumed?: string
+  /** when the person trusted the folder (ms) */
+  trustedAt?: number
+}
 
 /** relays/<job>.json, written by that job's takeover. */
 export type Relay = {
@@ -86,6 +96,8 @@ export function parseRelay(text: string | null): Relay | null {
       status: str(s.status) ?? 'unknown',
       ...(str(s.continue) ? { continue: str(s.continue)! } : {}),
       ...(str(s.prompt) ? { prompt: str(s.prompt)! } : {}),
+      ...(str(s.resumed) ? { resumed: str(s.resumed)! } : {}),
+      ...(sec(s.trustedAt) !== null ? { trustedAt: sec(s.trustedAt)! } : {}),
     })),
   }
 }
@@ -141,9 +153,15 @@ export function windowNote(j: JobState | null, now: number): { key: string; text
   }
 }
 
-/** The carry-on prompt waiting for this session after a move, if it is still fresh. */
+/**
+ * The carry-on prompt waiting for this session after a move, if it is still fresh. A
+ * session that stopped at the folder-trust question starts only once the person trusts
+ * the folder, however long after the move: that start is the moment, so it counts as fresh.
+ */
 export function carryOnFor(rel: Relay | null, sessionId: string, now: number): RelaySession | null {
-  if (!rel || rel.switchAt === null || now - rel.switchAt > CARRY_ON_MS) return null
-  const s = rel.sessions.find(x => x.id === sessionId)
-  return s && s.continue === 'pending' && s.prompt ? s : null
+  const s = rel?.sessions.find(x => x.id === sessionId)
+  if (!rel || !s || s.continue !== 'pending' || !s.prompt) return null
+  if (s.resumed === 'trust') return s
+  const since = s.trustedAt ?? rel.switchAt
+  return since !== null && now - since <= CARRY_ON_MS ? s : null
 }

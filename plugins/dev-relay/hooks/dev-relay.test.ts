@@ -88,6 +88,16 @@ describe('carry-on', () => {
     expect(carryOnFor(rel, 'sess-1', NOW + 20 * MIN)).toBeNull()
     expect(carryOnFor(parseRelay(relayFile({ sessions: [{ id: 'sess-1', status: 'working', continue: 'herdr', prompt: 'x' }] })), 'sess-1', NOW)).toBeNull()
   })
+
+  test('a session left at the folder-trust question gets it when the person trusts the folder, however late', () => {
+    const waiting = { id: 'sess-1', status: 'working', continue: 'pending', prompt: 'carry on', resumed: 'trust' }
+    const rel = parseRelay(relayFile({ switchAt: S(NOW - 3 * 3600 * 1000), sessions: [waiting] }))
+    expect(carryOnFor(rel, 'sess-1', NOW)?.prompt).toBe('carry on')
+    // the supervisor saw the answer first: fresh from then on
+    const trusted = parseRelay(relayFile({ switchAt: S(NOW - 3 * 3600 * 1000), sessions: [{ ...waiting, resumed: 'ok', trustedAt: S(NOW - MIN) }] }))
+    expect(carryOnFor(trusted, 'sess-1', NOW)?.prompt).toBe('carry on')
+    expect(carryOnFor(trusted, 'sess-1', NOW + 20 * MIN)).toBeNull()
+  })
 })
 
 type World = { files: Record<string, string>; submits: { text: string; kind: string; context: unknown }[]; statuses: (string | undefined)[]; argv: string[][] }
@@ -134,6 +144,17 @@ test('a resumed session that was working claims and sends its carry-on prompt, o
   const mine = w.submits.filter(s => s.kind === 'plugin')
   expect(mine).toHaveLength(1)
   expect(mine[0]!.text).toContain('carry on')
+})
+
+test('a session that waited for folder trust sends its carry-on as it starts, hours after the move', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const w = world(on, { SLURM_JOB_ID: '501' }, { [`${DIR}/relays/501.json`]: relayFile({
+    switchAt: S(NOW - 2 * 3600 * 1000),
+    sessions: [{ id: 'sess-1', pane: 'w8:p2', status: 'working', continue: 'pending', prompt: '[dev-relay: not typed by the user] carry on', resumed: 'trust' }],
+  }) })
+  await begin($)
+  expect(w.files[`${DIR}/claims/501-sess-1`]).toBe('sent\n')
+  expect(w.submits.filter(s => s.kind === 'plugin')).toHaveLength(1)
 })
 
 test('an idle session only comes back', async ($, on) => {
