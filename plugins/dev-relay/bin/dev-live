@@ -9,20 +9,23 @@
 #
 #     dev-live current [--wait S] [--node]   the live job (--node: its node)
 #     dev-live ensure [--node]               the same, submitting a dev-shell first when there is none
+#     dev-live sshd                          node:port of the live job's own sshd (SSHD_PORT), once it
+#                                            answers: for a laptop's ProxyCommand, `ssh -W`
 #
-# Exit 3: no dev-shell. Exit 4: squeue kept failing (Slurm didn't answer).
-# Settings as dev-relay's (JOB_NAME, SBATCH, SBATCH_ARGS, STATE_DIR in
+# Exit 3: no dev-shell. Exit 4: squeue kept failing (Slurm didn't answer). Exit 5: no sshd answers.
+# Settings as dev-relay's (JOB_NAME, SBATCH, SBATCH_ARGS, STATE_DIR, SSHD_PORT in
 # ~/.config/dev-relay/config, DEV_RELAY_<KEY> overrides).
 set -u
 
 JOB_NAME=dev-shell
 SBATCH=$HOME/slurm/dev-shell.sbatch
 SBATCH_ARGS=
+SSHD_PORT=
 STATE_DIR=$HOME/.local/state/dev-relay
 CONFIG_DIR=${DEV_RELAY_CONFIG_DIR:-$HOME/.config/dev-relay}
 if [[ -r $CONFIG_DIR/config ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line =~ ^[[:space:]]*(JOB_NAME|SBATCH|SBATCH_ARGS|STATE_DIR)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    [[ $line =~ ^[[:space:]]*(JOB_NAME|SBATCH|SBATCH_ARGS|SSHD_PORT|STATE_DIR)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
     v=${BASH_REMATCH[2]}
     v=${v%"${v##*[![:space:]]}"}
     v=${v#"${v%%[!\"\']*}"}
@@ -30,7 +33,7 @@ if [[ -r $CONFIG_DIR/config ]]; then
     printf -v "${BASH_REMATCH[1]}" %s "$v"
   done <"$CONFIG_DIR/config"
 fi
-for k in JOB_NAME SBATCH SBATCH_ARGS STATE_DIR; do
+for k in JOB_NAME SBATCH SBATCH_ARGS SSHD_PORT STATE_DIR; do
   o=DEV_RELAY_$k
   [[ -n ${!o+x} ]] && printf -v "$k" %s "${!o}"
 done
@@ -39,7 +42,7 @@ STALE=${DEV_LIVE_STALE:-120} # seconds after which ensure.lock.d was left by a c
 RETRY=${DEV_LIVE_RETRY:-30}  # seconds a failing squeue is retried, at least
 LOCK=$STATE_DIR/ensure.lock.d
 
-JOBS= LIVE_JOB=
+JOBS= LIVE_JOB= TARGET=
 
 # this user's dev-shell jobs into JOBS, one "id|state|node|comment|start|end" per line
 jobs() {
@@ -156,6 +159,40 @@ ensure() {
   current 1800
 }
 
+sshd_up() { timeout 3 bash -c "exec 3<>/dev/tcp/$1/$SSHD_PORT" 2>/dev/null; }
+
+job_node() { jq -r '.node // empty' "$STATE_DIR/jobs/$1.json" 2>/dev/null; }
+
+# node:port of the live job's sshd into TARGET. dev-relay's state first, with no Slurm call:
+# a connection that takes a Slurm step or an squeue each time is what VS Code gives up on.
+sshd_target() {
+  local act node i
+  if [[ ! $SSHD_PORT =~ ^[0-9]+$ ]]; then
+    echo "dev-live: SSHD_PORT is not set" >&2
+    return 5
+  fi
+  act=$(tr -d '[:space:]' <"$STATE_DIR/active" 2>/dev/null)
+  node=$(job_node "$act")
+  if [[ -n $node ]]; then
+    sshd_up "$node" && TARGET=$node:$SSHD_PORT && return 0
+    # live with no sshd there (started before SSHD_PORT was set): nothing to wait for
+    if current 0 && [[ $LIVE_JOB == "$act" ]]; then
+      echo "dev-live: no sshd on $node:$SSHD_PORT" >&2
+      return 5
+    fi
+  fi
+  ensure || return
+  node=$(job_node "$LIVE_JOB")
+  [[ -n $node ]] || node=$(timeout 120 squeue -h -j "$LIVE_JOB" -o %N 2>/dev/null)
+  # a job that has just started opens the port within seconds
+  for ((i = 0; i < 15; i++)); do
+    sshd_up "$node" && TARGET=$node:$SSHD_PORT && return 0
+    sleep 2
+  done
+  echo "dev-live: no sshd on $node:$SSHD_PORT" >&2
+  return 5
+}
+
 cmd=${1:-}
 (($#)) && shift
 wait=0 node=0
@@ -170,10 +207,13 @@ done
 case $cmd in
   current) current "${wait:-0}" ;;
   ensure) ensure ;;
+  sshd) sshd_target ;;
   *) sed -n '2,/^set -u/{/^#/s/^# \{0,1\}//p}' "$0" >&2; exit 2 ;;
 esac || exit
 
-if ((node)); then
+if [[ $cmd == sshd ]]; then
+  echo "$TARGET"
+elif ((node)); then
   n=$(timeout 120 squeue -h -j "$LIVE_JOB" -o %N 2>/dev/null)
   [[ -n $n && $n != \(* ]] || exit 3
   echo "$n"

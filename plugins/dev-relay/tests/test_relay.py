@@ -85,6 +85,8 @@ class World:
     def spawn(self, argv, env):
         self.ran.append(["<spawn>", *argv])
         self.envs.append(env)
+        if argv[0] != "herdr":
+            return
         prev = next((j for j, s in self.servers.items() if s["stopped"]), None)
         # herdr restores the layout it saved: the same panes, shells only
         panes = [dict(p, agent_status="unknown") for p in (self.servers[prev]["panes"] if prev else [])]
@@ -811,6 +813,60 @@ class LoginTest(unittest.TestCase):
         os.utime(lock, (old, old))
         self.assertEqual(self.live("ensure"), (0, "100"))
         self.assertFalse(lock.exists())
+
+    def node_state(self, node="127.0.0.1"):
+        (self.state / "active").write_text("100\n")
+        (self.state / "jobs").mkdir(exist_ok=True)
+        (self.state / "jobs" / "100.json").write_text(json.dumps({"job": "100", "node": node}))
+
+    def test_sshd_names_the_node_and_port_that_answer(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        self.addCleanup(srv.close)
+        port = srv.getsockname()[1]
+        self.node_state()
+        self.env["DEV_RELAY_SSHD_PORT"] = str(port)
+        self.assertEqual(self.live("sshd"), (0, f"127.0.0.1:{port}"))
+        self.assertEqual(self.sbatches(), [])
+
+    def test_sshd_on_a_job_started_without_one(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.close()                                         # a port nobody listens on
+        self.jobs("100|RUNNING|127.0.0.1|(null)|2026-10-29T10:00:00|2026-10-30T10:00:00")
+        self.node_state()
+        self.env["DEV_RELAY_SSHD_PORT"] = str(port)
+        self.assertEqual(self.live("sshd"), (5, ""))
+        self.assertEqual(self.sbatches(), [])
+
+    def test_sshd_needs_a_port(self):
+        self.env.pop("DEV_RELAY_SSHD_PORT", None)
+        self.assertEqual(self.live("sshd")[0], 5)
+
+
+class SshdTest(Base):
+    def test_a_port_starts_a_retrying_sshd(self):
+        self.mod.CFG.update(SSHD_PORT="24000", SSHD_CONFIG="/c/sshd_config")
+        self.mod.start_sshd()
+        spawned = [a for a in self.w.ran if a[0] == "<spawn>"]
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(spawned[0][1:3], ["bash", "-c"])
+        self.assertTrue(spawned[0][3].startswith("until /usr/sbin/sshd -D -p 24000 -f /c/sshd_config -E "))
+        self.assertNotIn(self.me, self.w.servers)          # not a herdr server
+
+    def test_no_port_no_sshd(self):
+        self.mod.CFG.update(SSHD_PORT="")
+        self.mod.start_sshd()
+        self.assertFalse([a for a in self.w.ran if a[0] == "<spawn>"])
+
+    def test_not_a_port_no_sshd(self):
+        self.mod.CFG.update(SSHD_PORT="22; rm -rf ~")
+        self.mod.start_sshd()
+        self.assertFalse([a for a in self.w.ran if a[0] == "<spawn>"])
 
 
 if __name__ == "__main__":
