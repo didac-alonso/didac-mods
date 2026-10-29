@@ -949,10 +949,16 @@ def moving_out_of(job: str) -> bool:
 def current(wait: float) -> str | None:
     """The live job. While a move is under way, or a new job is still starting its
     herdr server, it waits for the pointer (90 s at most); a queued dev-shell is
-    waited for up to `wait`."""
+    waited for up to `wait`. A failing squeue is retried (30 s at least), never
+    taken for "no jobs"."""
     start = now()
     while True:
-        jobs = dev_jobs() or []
+        jobs = dev_jobs()
+        if jobs is None:
+            if now() - start >= max(wait, 30):
+                return None
+            sleep(3)
+            continue
         live = [j for j in jobs if j["state"] in LIVE]
         act = read_active()
         t = now()
@@ -968,7 +974,7 @@ def current(wait: float) -> str | None:
 
 
 @contextmanager
-def dir_lock(path: Path, stale: float = 600):
+def dir_lock(path: Path, stale: float = 120):
     """mkdir is atomic on NFS, where $HOME lives (v3, no local locks: lockf can hang)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(900):
@@ -996,8 +1002,8 @@ def ensure(wait: float) -> str | None:
     # several clients connecting at once (VS Code opens a few) submit one job between them
     with dir_lock(state_dir() / "ensure.lock.d"):
         jid = current(0)
-        jobs = dev_jobs() or []
-        if not jid and not jobs:
+        # only a squeue that answered "none" submits one: a failing one would double the dev-shell
+        if not jid and dev_jobs() == []:
             jid = submit(None)
             if not jid:
                 return None
