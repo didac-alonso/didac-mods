@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# dev-live: dev-relay's `current` and `ensure`, for the login node.
+#
+# Explorer's login nodes SIGKILL every python3 process within a minute, sometimes
+# within seconds. A `dev-relay ensure` held up by a slow squeue or by the lock died
+# there with no traceback ("no hay dev-shell") and left ensure.lock.d behind for
+# the next ten minutes of clients. This is the same logic in bash; inside the job
+# dev-relay itself runs everything else.
+#
+#     dev-live current [--wait S] [--node]   the live job (--node: its node)
+#     dev-live ensure [--node]               the same, submitting a dev-shell first when there is none
+#
+# Exit 3: no dev-shell. Exit 4: squeue kept failing (Slurm didn't answer).
+# Settings as dev-relay's (JOB_NAME, SBATCH, SBATCH_ARGS, STATE_DIR in
+# ~/.config/dev-relay/config, DEV_RELAY_<KEY> overrides).
+set -u
+
+JOB_NAME=dev-shell
+SBATCH=$HOME/slurm/dev-shell.sbatch
+SBATCH_ARGS=
+STATE_DIR=$HOME/.local/state/dev-relay
+CONFIG_DIR=${DEV_RELAY_CONFIG_DIR:-$HOME/.config/dev-relay}
+if [[ -r $CONFIG_DIR/config ]]; then
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(JOB_NAME|SBATCH|SBATCH_ARGS|STATE_DIR)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    v=${BASH_REMATCH[2]}
+    v=${v%"${v##*[![:space:]]}"}
+    v=${v#"${v%%[!\"\']*}"}
+    v=${v%"${v##*[!\"\']}"}
+    printf -v "${BASH_REMATCH[1]}" %s "$v"
+  done <"$CONFIG_DIR/config"
+fi
+for k in JOB_NAME SBATCH SBATCH_ARGS STATE_DIR; do
+  o=DEV_RELAY_$k
+  [[ -n ${!o+x} ]] && printf -v "$k" %s "${!o}"
+done
+POLL=${DEV_LIVE_POLL:-3}     # seconds between looks
+STALE=${DEV_LIVE_STALE:-120} # seconds after which ensure.lock.d was left by a client that died
+RETRY=${DEV_LIVE_RETRY:-30}  # seconds a failing squeue is retried, at least
+LOCK=$STATE_DIR/ensure.lock.d
+
+JOBS= LIVE_JOB=
+
+# this user's dev-shell jobs into JOBS, one "id|state|node|comment|start|end" per line
+jobs() {
+  local out
+  out=$(timeout 120 squeue -u "$USER" -h -n "$JOB_NAME" -o '%i|%T|%N|%k|%S|%e' 2>/dev/null) || return 1
+  JOBS=$(awk -F'|' 'NF == 6 && $1 != ""' <<<"$out")
+}
+
+moving_out_of() {
+  local f
+  for f in "$STATE_DIR"/relays/*.json; do
+    [[ -e $f ]] || continue
+    jq -e --arg j "$1" '(.from // {}).job == $j and (.phase == "switching" or .phase == "resuming")' "$f" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+# The live job into LIVE_JOB. While a move is under way, or a new job is still
+# starting its herdr server, it waits for the pointer (90 s at most); a queued
+# dev-shell is waited for up to $1. A failing squeue is retried, never taken
+# for "no jobs".
+current() {
+  local wait=$1 start=$SECONDS t act live
+  while true; do
+    t=$((SECONDS - start))
+    if ! jobs; then
+      if ((t >= (wait > RETRY ? wait : RETRY))); then
+        echo "dev-live: Slurm no responde (squeue)" >&2
+        return 4
+      fi
+      sleep "$POLL"
+      continue
+    fi
+    live=$(awk -F'|' '$2 == "RUNNING" {print $5 "|" $1}' <<<"$JOBS" | sort -r | cut -d'|' -f2)
+    act=$(tr -d '[:space:]' <"$STATE_DIR/active" 2>/dev/null)
+    if [[ -n $act ]] && grep -qxF -- "$act" <<<"$live"; then
+      if ! moving_out_of "$act" || ((t >= (wait < 180 ? wait : 180))); then
+        LIVE_JOB=$act
+        return 0
+      fi
+    elif [[ -n $live ]]; then
+      if ((t >= (wait < 90 ? wait : 90))); then
+        LIVE_JOB=$(head -n1 <<<"$live")
+        return 0
+      fi
+    elif ((t >= wait)) || ! grep -q '^[^|]*|PENDING|' <<<"$JOBS"; then
+      return 3
+    fi
+    sleep "$POLL"
+  done
+}
+
+# mkdir is atomic on NFS. The trap takes the lock away with us on Ctrl-C or a dropped connection.
+take_lock() {
+  local i mtime
+  mkdir -p "$STATE_DIR"
+  for ((i = 0; i < 900; i++)); do
+    if mkdir "$LOCK" 2>/dev/null; then
+      trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM HUP
+      return 0
+    fi
+    if mtime=$(stat -c %Y "$LOCK" 2>/dev/null) && (($(date +%s) - mtime > STALE)); then
+      rmdir "$LOCK" 2>/dev/null
+      continue
+    fi
+    sleep 1
+  done
+}
+
+drop_lock() {
+  rmdir "$LOCK" 2>/dev/null
+  trap - EXIT INT TERM HUP
+}
+
+submit() {
+  local out v
+  local -a scrub=() args=()
+  # what a dev-shell must not inherit, as in dev-relay's SCRUB
+  while IFS= read -r v; do
+    scrub+=(-u "$v")
+  done < <(compgen -e | grep -E '^(CLAUDE|HERDR_|SLURM_|SBATCH_|SRUN_|SALLOC_|DEV_RELAY_PREV$)' | grep -vxE 'HERDR_(CONFIG_PATH|HOME)')
+  read -ra args <<<"$SBATCH_ARGS"
+  # a busy slurmctld takes a while to answer an sbatch
+  out=$(env "${scrub[@]}" timeout 300 sbatch --parsable "--job-name=$JOB_NAME" --export=ALL "${args[@]}" "$SBATCH" 2>&1)
+  v=$(tail -n1 <<<"$out")
+  v=${v%%;*}
+  if [[ ! $v =~ ^[0-9]+$ ]]; then
+    echo "dev-live: sbatch failed: $out" >&2
+    return 1
+  fi
+  echo "$v"
+}
+
+# several clients connecting at once (VS Code opens a few) submit one job between them
+ensure() {
+  local rc jid
+  take_lock
+  current 0
+  rc=$?
+  if ((rc == 4)); then
+    drop_lock
+    return 4
+  fi
+  if ((rc == 3)) && jobs && [[ -z $JOBS ]]; then
+    if ! jid=$(submit); then
+      drop_lock
+      return 3
+    fi
+    echo "submitted $jid, waiting for a node..." >&2
+  fi
+  drop_lock
+  current 1800
+}
+
+cmd=${1:-}
+(($#)) && shift
+wait=0 node=0
+while (($#)); do
+  case $1 in
+    --wait) wait=${2:-0} wait=${wait%%.*} && shift ;;
+    --node) node=1 ;;
+  esac
+  shift
+done
+
+case $cmd in
+  current) current "${wait:-0}" ;;
+  ensure) ensure ;;
+  *) sed -n '2,/^set -u/{/^#/s/^# \{0,1\}//p}' "$0" >&2; exit 2 ;;
+esac || exit
+
+if ((node)); then
+  n=$(timeout 120 squeue -h -j "$LIVE_JOB" -o %N 2>/dev/null)
+  [[ -n $n && $n != \(* ]] || exit 3
+  echo "$n"
+else
+  echo "$LIVE_JOB"
+fi

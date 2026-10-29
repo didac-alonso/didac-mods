@@ -49,6 +49,7 @@ class World:
         self.on_sleep = None  # scenario hook, called with the clock after each sleep
         self.where: list[str] = []  # the job an `srun dev-relay peek|release` is running in
         self.trust: set[str] = set()  # panes where a resumed Claude stops at the folder-trust question
+        self.down = False  # squeue fails while set
 
     # jobs and servers
     def job(self, jid: str, state="RUNNING", node="c0001", comment="", start=None, end=None):
@@ -128,6 +129,8 @@ class World:
         return 127, "", f"unknown {cmd}"
 
     def squeue(self, argv):
+        if self.down:
+            return 1, "", "slurm_load_jobs error: Socket timed out"
         if "-j" in argv:
             ids = [argv[argv.index("-j") + 1]]
         else:
@@ -689,6 +692,125 @@ class CurrentTest(Base):
         self.mod.cmd_run()
         self.assertIn(["scancel", "300"], self.w.ran)
         self.assertEqual(self.mod.read_active(), "100")
+
+    def test_a_failing_squeue_is_not_nothing(self):
+        self.w.job("100", start=T0 - 10, end=T0 + 3600)
+        self.mod.write_active("100")
+        self.w.down = True
+
+        def back(w):
+            if w.t >= T0 + 9:
+                w.down = False
+        self.w.on_sleep = back
+        self.assertEqual(self.mod.current(0), "100")
+
+    def test_ensure_never_submits_on_a_failing_squeue(self):
+        self.w.down = True
+        self.assertIsNone(self.mod.ensure(0))
+        self.assertFalse([a for a in self.w.ran if a[0] == "sbatch"])
+        self.assertFalse((self.state / "ensure.lock.d").exists())
+
+
+DEV_LIVE = BIN.with_name("dev-live")
+FAKE_SQUEUE = """#!/bin/bash
+[[ -e $FAKE/down ]] && { echo "slurm_load_jobs error: Socket timed out" >&2; exit 1; }
+if [[ $* == *" -j "* ]]; then
+  j=$(sed -E "s/.* -j ([^ ]+).*/\\1/" <<<"$*")
+  awk -F'|' -v j="$j" '$1 == j {print $3}' "$FAKE/jobs" 2>/dev/null
+else
+  cat "$FAKE/jobs" 2>/dev/null
+fi
+"""
+FAKE_SBATCH = """#!/bin/bash
+echo "$*" >>"$FAKE/sbatch"
+env >"$FAKE/sbatch.env"
+echo "500|RUNNING|c0042|(null)|2026-10-29T12:00:00|2026-10-31T12:00:00" >>"$FAKE/jobs"
+echo 500 >"$DEV_RELAY_STATE_DIR/active"
+echo "500;explorer"
+"""
+
+
+class LoginTest(unittest.TestCase):
+    """bin/dev-live, the login node's current/ensure, against a fake squeue and sbatch."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.fake, self.state = root / "fake", root / "state"
+        (root / "bin").mkdir()
+        self.fake.mkdir()
+        (self.state / "relays").mkdir(parents=True)
+        for name, body in (("squeue", FAKE_SQUEUE), ("sbatch", FAKE_SBATCH)):
+            p = root / "bin" / name
+            p.write_text(body)
+            p.chmod(0o755)
+        self.env = {**os.environ, "PATH": f"{root / 'bin'}:{os.environ['PATH']}", "FAKE": str(self.fake),
+                    "DEV_RELAY_STATE_DIR": str(self.state), "DEV_RELAY_CONFIG_DIR": str(root / "config"),
+                    "DEV_RELAY_SBATCH": "/x.sbatch", "DEV_LIVE_POLL": "0.1",
+                    "CLAUDE_CODE_CHILD_SESSION": "1", "SLURM_JOB_ID": "9", "HERDR_PANE_ID": "w1:p1", "HERDR_HOME": "/h"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def jobs(self, *lines):
+        (self.fake / "jobs").write_text("".join(line + "\n" for line in lines))
+
+    def live(self, *args):
+        import subprocess
+        r = subprocess.run(["bash", str(DEV_LIVE), *args], env=self.env, capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout.strip()
+
+    def sbatches(self):
+        p = self.fake / "sbatch"
+        return p.read_text().splitlines() if p.exists() else []
+
+    def test_live_pointer_and_its_node(self):
+        self.jobs("100|RUNNING|c0001|(null)|2026-10-29T10:00:00|2026-10-30T10:00:00",
+                  "501|RUNNING|c0002|relay-of:100|2026-10-29T11:00:00|2026-10-31T11:00:00")
+        (self.state / "active").write_text("100\n")
+        self.assertEqual(self.live("current"), (0, "100"))
+        self.assertEqual(self.live("ensure", "--node"), (0, "c0001"))
+        self.assertEqual(self.sbatches(), [])
+
+    def test_a_move_under_way_is_waited_for(self):
+        self.jobs("100|RUNNING|c0001|(null)|2026-10-29T10:00:00|2026-10-30T10:00:00")
+        (self.state / "active").write_text("100\n")
+        (self.state / "relays" / "501.json").write_text(json.dumps({"phase": "switching", "from": {"job": "100"}}))
+        import time
+        t = time.time()
+        self.assertEqual(self.live("current", "--wait", "2"), (0, "100"))
+        self.assertGreaterEqual(time.time() - t, 1)
+
+    def test_nothing(self):
+        self.jobs()
+        self.assertEqual(self.live("current")[0], 3)
+
+    def test_a_failing_squeue_is_not_nothing(self):
+        (self.fake / "down").touch()
+        self.env["DEV_LIVE_RETRY"] = "1"
+        self.assertEqual(self.live("ensure")[0], 4)
+        self.assertEqual(self.sbatches(), [])
+        self.assertFalse((self.state / "ensure.lock.d").exists())
+
+    def test_ensure_submits_one_with_a_clean_env(self):
+        self.jobs()
+        self.assertEqual(self.live("ensure"), (0, "500"))
+        self.assertEqual(self.live("ensure"), (0, "500"))      # a second client finds it
+        self.assertEqual(self.sbatches(), ["--parsable --job-name=dev-shell --export=ALL /x.sbatch"])
+        env = (self.fake / "sbatch.env").read_text().splitlines()
+        self.assertFalse([v for v in env if re.match(r"(CLAUDE|SLURM_|HERDR_PANE)", v)])
+        self.assertIn("HERDR_HOME=/h", env)
+        self.assertFalse((self.state / "ensure.lock.d").exists())
+
+    def test_a_lock_left_by_a_killed_client_is_taken_over(self):
+        self.jobs("100|RUNNING|c0001|(null)|2026-10-29T10:00:00|2026-10-30T10:00:00")
+        (self.state / "active").write_text("100\n")
+        lock = self.state / "ensure.lock.d"
+        lock.mkdir()
+        old = lock.stat().st_mtime - 300
+        os.utime(lock, (old, old))
+        self.assertEqual(self.live("ensure"), (0, "100"))
+        self.assertFalse(lock.exists())
 
 
 if __name__ == "__main__":

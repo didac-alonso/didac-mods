@@ -63,6 +63,13 @@ jid=$(dev-relay current)                  # dev(): srun --jobid="$jid" --overlap
 node=$(dev-relay ensure --node)           # submits a dev-shell first when there is none
 ```
 
+On a login node use `dev-live` instead, with the same arguments. Explorer's login nodes SIGKILL every `python3` process within a minute, sometimes within seconds. A `dev-relay ensure` waiting on a slow squeue or on the lock died there with no message and left `ensure.lock.d` behind. `dev-live` is the same `current` and `ensure` in bash. It exits 3 when there is no dev-shell and 4 when squeue keeps failing; a failing squeue never leads to a second dev-shell. Link it next to `dev-relay`:
+
+```sh
+ln -s "$PWD/plugins/dev-relay/bin/dev-live" ~/.local/bin/dev-live
+jid=$(dev-live ensure)                    # dev(), dev-sshd
+```
+
 ## Settings
 
 Put these in `~/.config/dev-relay/config` as `KEY=VALUE` lines. Environment variables `DEV_RELAY_<KEY>` override them.
