@@ -54,6 +54,8 @@ DEFAULTS = {
     "HERDR_SESSION": "",    # empty: herdr's default session
     "CLAUDE_ARGS": "",      # extra flags for `claude --resume <id>` (shell words)
     "CARD": "1",            # a Discord card after a move, while you're away
+    "SSHD_PORT": "",        # a personal sshd on this port for the job's life (VS Code, Claude Desktop); empty: none
+    "SSHD_CONFIG": str(HOME / ".ssh" / "dev-sshd" / "sshd_config"),
     "STATE_DIR": str(HOME / ".local" / "state" / "dev-relay"),
     "CONFIG_DIR": str(HOME / ".config" / "dev-relay"),
 }
@@ -353,6 +355,22 @@ def start_server() -> bool:
         sleep(1)
     log("herdr server did not answer within 30 s")
     return False
+
+
+def start_sshd() -> None:
+    """With SSHD_PORT set, a personal sshd on that port for as long as the job lives: how VS Code
+    and Claude Desktop reach the node without a Slurm step per connection (`dev-live sshd`).
+    It retries while the port is still taken (a move to the same node) and after a crash."""
+    port = CFG["SSHD_PORT"]
+    if not port:
+        return
+    if not port.isdigit():
+        log(f"SSHD_PORT={port!r} is not a port: no sshd")
+        return
+    out = state_dir() / f"sshd-{own_job()}.log"
+    loop = f"until /usr/sbin/sshd -D -p {port} -f {shlex.quote(CFG['SSHD_CONFIG'])} -E {shlex.quote(str(out))}; do sleep 10; done"
+    spawn_server(["bash", "-c", loop], clean_env(keep_slurm=True))
+    log(f"sshd on port {port}")
 
 
 def session_json_sessions() -> list[dict]:
@@ -915,6 +933,7 @@ def cmd_run() -> None:
     if not me:
         sys.exit("dev-relay run: not inside a Slurm job")
     state_dir().mkdir(parents=True, exist_ok=True)
+    start_sshd()
     prev = os.environ.get("DEV_RELAY_PREV") or None
     if prev == me:
         prev = None

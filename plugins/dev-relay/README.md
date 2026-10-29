@@ -70,6 +70,53 @@ ln -s "$PWD/plugins/dev-relay/bin/dev-live" ~/.local/bin/dev-live
 jid=$(dev-live ensure)                    # dev(), dev-sshd
 ```
 
+## VS Code and Claude Desktop
+
+These apps want an SSH host. A ProxyCommand that runs `srun --overlap … sshd -i` per connection takes a Slurm step each time. Under a busy slurmctld that is 20–50 s a connection, one after the other, and VS Code opens several and gives up. Set `SSHD_PORT` and dev-relay starts a personal sshd on that port in every dev-shell instead, for as long as the job lives. A connection is then a TCP tunnel through the login node, about a second, with no Slurm call: `dev-live sshd` reads the node from dev-relay's state.
+
+On the cluster, once:
+
+```sh
+mkdir -p ~/.ssh/dev-sshd
+ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/dev-sshd/host_ed25519
+cat > ~/.ssh/dev-sshd/sshd_config <<EOF
+HostKey $HOME/.ssh/dev-sshd/host_ed25519
+AuthorizedKeysFile $HOME/.ssh/authorized_keys
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PidFile none
+Subsystem sftp internal-sftp
+EOF
+echo 'SSHD_PORT=<port>' >> ~/.config/dev-relay/config   # a free port above 1024
+```
+
+On your laptop, in `~/.ssh/config`, with `cluster` the Host for a login node:
+
+```
+Host cluster
+    HostName <login node>
+    User <you>
+    ControlMaster auto
+    ControlPath ~/.ssh/cm/%C
+    ControlPersist 10m
+
+Host dev
+    User <you>
+    ProxyCommand sh -c 'exec ssh -W "$(ssh -n cluster .local/bin/dev-live sshd)" cluster'
+    HostKeyAlias dev
+    UserKnownHostsFile ~/.ssh/known_hosts_dev
+```
+
+- **`-n`.** The ProxyCommand's stdin is the outer SSH connection. Without `-n`, the lookup reads bytes of it and the connection fails with "Bad packet length".
+- **`HostKeyAlias`.** The node changes with every move but the host key doesn't, so one known host covers them all.
+- **`-W` and the shared connection.** A tunnel through the shared connection is not a session on the login node. Stuck connections from the apps can't use up its `MaxSessions` and lock your terminals out.
+- **When it starts.** The sshd starts with the next dev-shell. Move to one with `dev-relay now`.
+- **Exit codes.** `dev-live sshd` exits 5 when no sshd answers, for example on a job started before `SSHD_PORT` was set.
+
+The sshd runs inside the job, so its sessions get the job's CPUs and memory and end with it; the apps reconnect to the new node. It listens on the cluster network and takes your key only. Check that your cluster allows user services on compute nodes.
+
 ## Settings
 
 Put these in `~/.config/dev-relay/config` as `KEY=VALUE` lines. Environment variables `DEV_RELAY_<KEY>` override them.
@@ -85,6 +132,8 @@ Put these in `~/.config/dev-relay/config` as `KEY=VALUE` lines. Environment vari
 | `HERDR_SESSION` | | a named herdr session instead of the default one |
 | `CLAUDE_ARGS` | | extra flags for `claude --resume <id>` |
 | `CARD` | 1 | the Discord card after a move |
+| `SSHD_PORT` | | a personal sshd on this port in every dev-shell (see VS Code and Claude Desktop) |
+| `SSHD_CONFIG` | ~/.ssh/dev-sshd/sshd_config | that sshd's config |
 
 State lives in `~/.local/state/dev-relay`:
 
