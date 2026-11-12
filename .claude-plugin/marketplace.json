@@ -39,6 +39,11 @@
       "name": "subagent-policy",
       "source": "./plugins/subagent-policy",
       "description": "Makes delegating to subagents the natural move and their model and effort a conscious choice: a short guide, nudges, every Agent call naming both, and stats."
+    },
+    {
+      "name": "handoff",
+      "source": "./plugins/handoff",
+      "description": "When the chat gets big, offers Refresh: writes a handoff of the whole chat, then clears it and leaves the handoff in the prompt box, copies it, or opens a new chat with it."
     }
   ]
 }

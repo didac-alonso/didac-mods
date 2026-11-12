@@ -11,6 +11,7 @@ Claude Code mods for working on a Slurm GPU cluster.
 | [dev-relay](plugins/dev-relay) | Keeps the dev-shell alive past Slurm's time limit: a successor job takes over, every Claude session resumes in its herdr pane on the new node, and the ones that were working carry on. |
 | [job-watch](plugins/job-watch) | For your laptop, not the cluster: the same job watcher over one `ssh <host> bash -s` a minute, with hoverable loss, val, GPU-history and sweep charts in the desktop app. Needs an ssh alias that logs in without a prompt. |
 | [subagent-policy](plugins/subagent-policy) | Makes delegating to subagents the natural move and their model and effort a conscious choice, from criteria rather than archetypes: a short guide, nudges when main-loop work would be cheaper delegated, every Agent call naming both, and `/subagent-policy` stats of what was chosen and what it cost. |
+| [handoff](plugins/handoff) | When the chat gets big, offers Refresh: writes a handoff of the whole chat, then runs `/clear` and leaves the handoff in the prompt box for you to send. It can also copy it or open a new chat with it. Based on the handoff mod in Ben AI's token-saving-mods pack. |
 
 ## Install
 
@@ -23,6 +24,7 @@ At a Claude Code prompt (Claude Code 2.1.292 or newer):
 /plugin install plan-line@didac-mods
 /plugin install discord-drop@didac-mods
 /plugin install dev-relay@didac-mods
+/plugin install handoff@didac-mods
 /plugin install subagent-policy@didac-mods
 ```
 
