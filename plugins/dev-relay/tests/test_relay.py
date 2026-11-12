@@ -712,6 +712,30 @@ class CurrentTest(Base):
         self.assertFalse([a for a in self.w.ran if a[0] == "sbatch"])
         self.assertFalse((self.state / "ensure.lock.d").exists())
 
+    def test_ensure_submits_past_a_job_on_its_way_out(self):
+        self.w.job("100", state="COMPLETING", node="c0001", start=T0 - 100, end=T0 + 3600)
+        self.mod.write_active("100")
+
+        def starts(w):
+            j = w.jobs.get("500")
+            if j and w.t >= T0 + 30:
+                j.update(state="RUNNING", node="c0042", start=T0 + 30)
+            if j and w.t >= T0 + 40:
+                self.mod.write_active("500")
+        self.w.on_sleep = starts
+        self.assertEqual(self.mod.ensure(0), "500")
+        self.assertEqual(len([a for a in self.w.ran if a[0] == "sbatch"]), 1)
+
+    def test_a_configuring_job_is_waited_for(self):
+        self.w.job("300", state="CONFIGURING", node="c0042")
+
+        def starts(w):
+            if w.t >= T0 + 20:
+                w.jobs["300"].update(state="RUNNING", start=T0 + 20)
+                self.mod.write_active("300")
+        self.w.on_sleep = starts
+        self.assertEqual(self.mod.current(1800), "300")
+
 
 DEV_LIVE = BIN.with_name("dev-live")
 FAKE_SQUEUE = """#!/bin/bash
@@ -809,7 +833,7 @@ class LoginTest(unittest.TestCase):
         (self.state / "active").write_text("100\n")
         lock = self.state / "ensure.lock.d"
         lock.mkdir()
-        old = lock.stat().st_mtime - 300
+        old = lock.stat().st_mtime - 900
         os.utime(lock, (old, old))
         self.assertEqual(self.live("ensure"), (0, "100"))
         self.assertFalse(lock.exists())
@@ -846,6 +870,12 @@ class LoginTest(unittest.TestCase):
     def test_sshd_needs_a_port(self):
         self.env.pop("DEV_RELAY_SSHD_PORT", None)
         self.assertEqual(self.live("sshd")[0], 5)
+
+    def test_ensure_submits_past_a_job_on_its_way_out(self):
+        self.jobs("100|COMPLETING|c0001|(null)|2026-10-29T10:00:00|2026-10-30T10:00:00")
+        (self.state / "active").write_text("100\n")
+        self.assertEqual(self.live("ensure"), (0, "500"))
+        self.assertEqual(len(self.sbatches()), 1)
 
 
 class SshdTest(Base):
