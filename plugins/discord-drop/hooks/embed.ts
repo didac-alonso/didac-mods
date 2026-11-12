@@ -175,6 +175,11 @@ export function patchArgv(json: string): string[] {
   return ['curl', '-sS', '--max-time', '30', '-K', '-', '-w', '\n%{http_code}', '-X', 'PATCH', '-H', 'Content-Type: application/json', '--data-raw', json]
 }
 
+/** curl removing a message the webhook sent. */
+export function deleteArgv(): string[] {
+  return ['curl', '-sS', '--max-time', '30', '-K', '-', '-w', '\n%{http_code}', '-X', 'DELETE']
+}
+
 export const postUrl = (base: string) => `${base}?wait=true`
 export const messageUrl = (base: string, id: string) => `${base}/messages/${id}`
 

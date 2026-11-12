@@ -9,7 +9,7 @@ import type { Lang } from './embed'
 
 /** The part of pace-line's state read here (pace-line's types/index.d.ts has the whole). */
 export type PaceSeries = { step: number[]; value: number[] }
-export type PaceMetrics = { keys: Record<string, PaceSeries>; lastStep: number | null; totalSteps: number | null; epoch: number | null; totalEpochs: number | null }
+export type PaceMetrics = { keys: Record<string, PaceSeries>; lastStep: number | null; totalSteps: number | null; epoch: number | null; totalEpochs: number | null; firstStep?: number | null; firstTime?: number | null; lastTime?: number | null }
 export type PaceJob = {
   id: string
   jobId: string
@@ -27,6 +27,13 @@ export type PaceJob = {
   lastLines: string[]
   metrics: PaceMetrics | null
   ckpt: { name: string; path: string } | null
+  endedAt?: number | null
+  /** A k/n count from the log (tqdm and the like). */
+  progress?: { k: number; n: number } | null
+  /** Whose Claude gets its alerts, seen from this session. */
+  owner?: 'mine' | 'other' | 'none'
+  /** When it is this session's: the subagent that launched it, or null. */
+  ownerAgent?: string | null
 }
 export type PaceAlert = { job: string; kind: string; level: 'info' | 'warn' | 'error'; text: string; at: number }
 export type PaceJobs = { jobs: PaceJob[]; alerts: PaceAlert[] }
@@ -117,6 +124,7 @@ export function alertDrop(a: PaceAlert, job: PaceJob | undefined, lang: Lang, im
     eta: null,
     final: false,
     force: false,
+    card: null,
     author: job ? `${job.name} (${job.id})` : `job ${a.job}`,
     footer: `job ${a.job}`,
   }

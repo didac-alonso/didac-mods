@@ -201,6 +201,8 @@ const waiting = new Set<string>()
 let me: string | null = null
 /** ~/.cache/pace-line/claims: one file per subagent an alert resumed, holding what it submitted since. */
 let claimsDir: string | null = null
+/** discord-drop's outbox (~/.claude/discord-drop/outbox): a card a resumed subagent can't `: drop` goes there as a file. */
+let outboxDir: string | null = null
 let polling = false
 let paneOpen = false
 let disksAt = 0
@@ -276,6 +278,7 @@ async function startWatch($: EngineInterface, cfg: WatchConfig, ownJob: string |
   ctx = { user, ownJob, zone: zoneMinutes(z ?? '+0000'), cfg }
   const home = await $.env.get('HOME')
   claimsDir = home ? `${home}/.cache/pace-line/claims` : null
+  outboxDir = home ? `${home}/.claude/discord-drop/outbox` : null
   await forgetOld($)
   await beat($)
   await poll($)
@@ -487,7 +490,10 @@ async function poll($: EngineInterface): Promise<void> {
     const owners = await whoseAll($, next.map(j => j.id), t)
     await update($, jobsAtom, s => ({
       ...s,
-      jobs: next.map(j => ({ ...j, owner: owners.get(baseId(j.id))?.whose ?? 'none' })),
+      jobs: next.map(j => {
+        const o = owners.get(baseId(j.id))
+        return { ...j, owner: o?.whose ?? 'none', ownerAgent: o?.whose === 'mine' ? o.owner?.agentId ?? null : null }
+      }),
       selected: s.selected ?? next[0]?.id ?? null,
       updatedAt: t,
       error: null,
@@ -723,9 +729,10 @@ async function deliver($: EngineInterface, d: Delivery): Promise<void> {
         // (Hooks don't see a send of this plugin's own, nor, it seems, the tool calls of an agent it resumes.)
         waiting.delete(agentId)
         const claims = claimsDir ? claimFile(claimsDir, agentId) : null
+        const outbox = outboxDir ? `${outboxDir}/${agentId}` : null
         try {
           if (claimsDir) await run($, ['mkdir', '-p', claimsDir])
-          isDelivered = (await $.session.send({ to: { agentId }, text: runnerText(as.map(a => a.text).join('\n'), logsOf(as), claims) })).isDelivered
+          isDelivered = (await $.session.send({ to: { agentId }, text: runnerText(as.map(a => a.text).join('\n'), logsOf(as), claims, outbox) })).isDelivered
           if (isDelivered && me) {
             resumedAgents.add(agentId)
             // If it forgets the tee: a job showing up within 2 min is guessed to be its.

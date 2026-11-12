@@ -8,6 +8,8 @@ import { chartSvg } from './chart'
 import { adoptedSuccessor, dropFrom, fmtDur, isAway, latestUserAt, nextPurge, opFrom, presenceWith, relayArmed, routeFor, successorAlive } from './drop'
 import type { Drop } from './drop'
 import { attachments, card, COLOR, curlConfig, parseCurl, payload, postArgv, progressBar, SILENT } from './embed'
+import { cardDrop, commonPrefix, refresh } from './jobcards'
+import type { JobCard } from './jobcards'
 
 const NOW = Date.parse('2026-10-15T15:00:00Z')
 const MIN = 60_000
@@ -197,6 +199,7 @@ function world(on: On, env: Record<string, string> = {}): World {
     if (a[0] === 'date') return ok('-0400\n')
     if (a[0] === 'squeue') return ok(w.squeue[a[a.indexOf('-j') + 1]!] ?? '')
     if (a[0] === 'rsvg-convert') w.files[a[a.indexOf('-o') + 1]!] = 'png'
+    if (a[0] === 'rm') delete w.files[a[a.length - 1]!]
     return ok('')
   })
   on('fs.read', (_$, e) => (e.path in w.files ? { value: w.files[e.path]! } : { deny: 'missing' }))
@@ -205,6 +208,10 @@ function world(on: On, env: Record<string, string> = {}): World {
     return { value: undefined }
   })
   on('fs.exists', (_$, e) => ({ value: e.path in w.files }))
+  on('fs.list', (_$, e) => {
+    const names = Object.keys(w.files).filter(p => p.startsWith(`${e.path}/`) && !p.slice(e.path.length + 1).includes('/'))
+    return names.length ? { value: names.map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: NOW, isLink: false })) } : { deny: 'missing' }
+  })
   on('fs.stat', (_$, e) => (e.path in w.files ? { value: { kind: 'file' as const, size: w.files[e.path]!.length, mtimeMs: NOW, isLink: false } } : { deny: 'missing' }))
   on('prompt.submit', (_$, e) => {
     w.contexts.push(e.context)
@@ -220,7 +227,7 @@ const begin = async ($: Engine) => $.session.start({ cwd: '/w/detr', surface: 't
 const say = ($: Engine, kind: 'composer' | 'task-notification' = 'composer') => $.prompt.submit({ text: 'hola', origin: { kind }, wait: false })
 const dropCall = ($: Engine, op: Record<string, unknown>) => $.tool.call({ tool: 'Bash', command: `: drop <<'EOF'\n${JSON.stringify(op)}\nEOF` })
 const out = (r: unknown) => JSON.stringify(r)
-const posted = (w: World) => w.curl.map(c => {
+const posted = (w: World) => w.curl.filter(c => !c.argv.includes('DELETE')).map(c => {
   const form = c.argv.find(x => x.startsWith('payload_json='))
   const data = c.argv[c.argv.indexOf('--data-raw') + 1]
   return { method: c.argv.includes('PATCH') ? 'PATCH' : 'POST', body: JSON.parse(form ? form.slice('payload_json='.length) : data!) as Record<string, unknown>, stdin: c.stdin }
@@ -452,4 +459,140 @@ test('an adopted relay holds the hand-off while squeue still has the successor',
   delete w.squeue['501'] // cancelled before it ever ran
   await clock.advance(2 * MIN)
   expect(w.asked.filter(t => t.includes('this allocation (Slurm job 100)'))).toHaveLength(1)
+})
+
+// ── progress cards for this session's jobs ──
+
+const run = (id: string, name: string, over: Partial<PaceJob> = {}): PaceJob => ({
+  ...JOB, id, jobId: id, name, state: 'RUNNING', elapsedS: 600, submittedAt: NOW, startedAt: NOW, exitCode: null, lastLines: [], ckpt: null, endedAt: null, owner: 'mine', ownerAgent: null,
+  metrics: { keys: { loss: { step: [0, 100], value: [2, 1] } }, lastStep: 100, totalSteps: 400, epoch: null, totalEpochs: null, firstStep: 0, firstTime: NOW / 1000 - 600, lastTime: NOW / 1000 },
+  ...over,
+})
+
+describe('job cards', () => {
+  let n = 0
+  const key = () => `k${n++}`
+
+  test('jobs one Claude launches together share a card; a later launch opens another, a subagent keeps its own', () => {
+    let cards: JobCard[] = refresh([], [run('3001', 'sweep-lr1e-4'), run('3002', 'sweep-lr3e-4', { submittedAt: NOW + 2 * MIN })], 'es', NOW + 3 * MIN, key)
+    expect(cards).toHaveLength(1)
+    expect(cards[0]!.rows.map(r => r.id)).toEqual(['3001', '3002'])
+    cards = refresh(cards, [run('3003', 'eval', { submittedAt: NOW + 40 * MIN }), run('3004', 'chain-a', { ownerAgent: 'r1', submittedAt: NOW + 41 * MIN })], 'es', NOW + 42 * MIN, key)
+    expect(cards.map(c => c.rows.map(r => r.id))).toEqual([['3001', '3002'], ['3003'], ['3004']])
+    // the subagent's next job, an hour on, joins its card
+    cards = refresh(cards, [run('3005', 'chain-b', { ownerAgent: 'r1', submittedAt: NOW + 100 * MIN })], 'es', NOW + 101 * MIN, key)
+    expect(cards[2]!.rows.map(r => r.id)).toEqual(['3004', '3005'])
+  })
+
+  test('a card shows a line per job, the shared progress and ETA, and waits for the results', () => {
+    const cards = refresh([], [run('3001', 'sweep-lr1e-4'), run('3002', 'sweep-lr3e-4', { state: 'PENDING', metrics: null })], 'es', NOW, () => 'k')
+    const d = cardDrop(cards[0]!, 'es')
+    expect(d.title).toBe('sweep · 2 jobs')
+    expect(d.text).toContain('▶ `lr1e-4` paso 100/400 · loss')
+    expect(d.text).toContain('⏸ `lr3e-4` en cola')
+    expect(d.progress).toBe(0.125)
+    expect(d.eta).toBe(null) // one is still queued
+    const done = refresh(cards, [run('3001', 'sweep-lr1e-4', { state: 'COMPLETED', endedAt: NOW }), run('3002', 'sweep-lr3e-4', { state: 'FAILED', endedAt: NOW })], 'es', NOW, () => 'k')
+    const e = cardDrop(done[0]!, 'es')
+    expect(e.text).toContain('✓ `lr1e-4` terminó')
+    expect(e.text).toContain('✗ `lr3e-4` falló')
+    expect(e.text).toContain('resultados que pediste llegarán aquí')
+    expect(e.progress).toBe(1)
+    expect(commonPrefix(['a', 'b'])).toBe('')
+  })
+
+  test('a job that ended long before any card is left alone', () => {
+    expect(refresh([], [run('2999', 'old', { state: 'COMPLETED', endedAt: NOW - 3600_000 })], 'es', NOW, () => 'k')).toEqual([])
+  })
+})
+
+function paceState(on: On, get: () => PaceJob[]) {
+  on('state.get', (_$, e) => (e.plugin === 'pace-line' && e.key === 'jobs' ? { value: { value: { jobs: get(), alerts: [] }, version: 1 } } : { value: { value: undefined, version: 0 } }))
+}
+
+test('a launch gets one silent progress card, edited as it runs, even while the user is here', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  let jobs = [run('3001', 'sweep-lr1e-4'), run('3002', 'sweep-lr3e-4')]
+  paceState(on, () => jobs)
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  let p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['POST'])
+  expect(p[0]!.body.flags).toBe(SILENT)
+  // a new step: edited, but at most once a minute
+  jobs = [run('3001', 'sweep-lr1e-4', { metrics: { ...jobs[0]!.metrics!, lastStep: 200 } }), jobs[1]!]
+  await clock.advance(16_000)
+  expect(posted(w)).toHaveLength(1)
+  await clock.advance(60_000)
+  p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['POST', 'PATCH'])
+  expect(p[1]!.stdin).toContain('/messages/m1')
+  // an end shows at once
+  jobs = [run('3001', 'sweep-lr1e-4', { state: 'COMPLETED', endedAt: NOW + 2 * MIN }), jobs[1]!]
+  await clock.advance(16_000)
+  expect(posted(w).map(x => x.method)).toEqual(['POST', 'PATCH', 'PATCH'])
+  // another session's job, or nobody's: no card
+  jobs = [...jobs, run('4001', 'other', { owner: 'other' })]
+  await clock.advance(76_000)
+  expect(posted(w).filter(x => x.method === 'POST')).toHaveLength(1)
+})
+
+test('the results sent with "card" replace the progress card: silent while here, notifying when away', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  const jobs = [run('3001', 'sweep-lr1e-4', { state: 'COMPLETED', endedAt: NOW })]
+  paceState(on, () => jobs)
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  expect(out(await dropCall($, { card: '3001', kind: 'result', title: 'Sweep lr', text: 'best lr 3e-4: Acc 87.3', fields: [{ name: 'lr 3e-4', value: '87.3' }] }))).toContain('replaced')
+  const p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['POST', 'POST'])
+  expect(p[1]!.body.flags).toBe(SILENT)
+  expect((p[1]!.body.embeds as { title: string }[])[0]!.title).toContain('Sweep lr')
+  expect(w.curl[2]!.argv).toContain('DELETE')
+  expect(w.curl[2]!.stdin).toContain('/messages/m1')
+  // no longer edited
+  await clock.advance(120_000)
+  expect(w.curl).toHaveLength(3)
+})
+
+test('away, the results notify; a job with no card sends its drop as usual', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  paceState(on, () => [run('3001', 'train', { state: 'COMPLETED', endedAt: NOW })])
+  await begin($)
+  await say($)
+  await clock.advance(31 * MIN)
+  expect(out(await dropCall($, { card: '3001', kind: 'result', title: 'Train', text: 'Acc 90' }))).toContain('with a notification')
+  expect(posted(w).at(-1)!.body.flags).toBe(undefined)
+  expect(out(await dropCall($, { card: '9999', kind: 'result', title: 'Other', text: 'x' }))).not.toContain('replaced')
+})
+
+test('a resumed subagent\'s card file in the outbox is sent and removed; another session\'s is left', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  paceState(on, () => [run('3001', 'chain-a', { ownerAgent: 'r1', state: 'COMPLETED', endedAt: NOW })])
+  await begin($)
+  await say($)
+  w.files['/home/demo/.claude/discord-drop/outbox/r1-1.json'] = JSON.stringify({ card: '3001', kind: 'result', title: 'Chain', text: '11 + 77 = 88' })
+  w.files['/home/demo/.claude/discord-drop/outbox/zz-1.json'] = JSON.stringify({ kind: 'done', title: 'not mine' })
+  await clock.advance(16_000)
+  await clock.advance(16_000)
+  expect('/home/demo/.claude/discord-drop/outbox/r1-1.json' in w.files).toBe(false)
+  expect('/home/demo/.claude/discord-drop/outbox/zz-1.json' in w.files).toBe(true)
+  expect(posted(w).some(x => JSON.stringify(x.body).includes('11 + 77 = 88'))).toBe(true)
+})
+
+test('a pace-line alert about carded jobs tells Claude where their results go', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  paceState(on, () => [run('3001', 'train', { state: 'COMPLETED', endedAt: NOW })])
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  await $.prompt.submit({ text: '[pace-line: batch-job alerts, from the job watcher, not typed by the user]\n✓ train (3001) completed after 2h', origin: { kind: 'plugin' }, wait: false } as never)
+  expect(w.contexts.at(-1)?.some(c => c.includes('"card": "3001"'))).toBe(true)
 })
