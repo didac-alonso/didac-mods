@@ -23,13 +23,13 @@ At a Claude Code prompt (Claude Code 2.1.292 or newer):
 /plugin install plan-line@didac-mods
 /plugin install discord-drop@didac-mods
 /plugin install dev-relay@didac-mods
+/plugin install subagent-policy@didac-mods
 ```
 
 On your own computer, instead:
 
 ```
 /plugin install job-watch@didac-mods
-/plugin install subagent-policy@didac-mods
 ```
 
 ## Develop
