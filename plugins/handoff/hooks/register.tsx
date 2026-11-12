@@ -345,6 +345,28 @@ async function log($: EngineInterface, line: string) {
   }
 }
 
+// The chat as plain text for the fallback, newest kept when it is too long:
+// each message's text, each tool call's name and main input, short results.
+const TRANSCRIPT_CHARS = 400_000
+function transcriptText(messages: SessionMessage[]) {
+  const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s)
+  const parts: string[] = []
+  for (const m of messages) {
+    const lines: string[] = []
+    if (m.text.trim()) lines.push(cut(m.text.trim(), 6000))
+    for (const u of m.toolUses) {
+      const inp = u.input as Record<string, unknown>
+      const main = inp.command ?? inp.file_path ?? inp.path ?? inp.pattern ?? inp.url ?? inp.query ?? inp.description ?? ''
+      const out = typeof u.text === 'string' && u.text.trim() ? ` → ${u.isError ? 'error: ' : ''}${cut(u.text.trim().replace(/\s+/g, ' '), 300)}` : ''
+      lines.push(`[${u.tool}] ${cut(String(main).replace(/\s+/g, ' '), 300)}${out}`)
+    }
+    if (lines.length) parts.push(`${m.role === 'user' ? 'USER' : 'ASSISTANT'}: ${lines.join('\n')}`)
+  }
+  let text = redact(parts.join('\n\n'))
+  if (text.length > TRANSCRIPT_CHARS) text = `[earlier messages cut]\n\n${text.slice(-TRANSCRIPT_CHARS)}`
+  return text
+}
+
 // A plain handoff built from the transcript alone, saved before the model step,
 // so a failed or slow model call still leaves something to start from.
 function draftText(cwd: string, g: Gathered) {
@@ -375,6 +397,7 @@ async function run($: EngineInterface) {
   if (busy) return
   busy = true
   let draftPath = ''
+  let viaTranscript = false
   const { context } = await $.session.usage()
   await setPanel($, { phase: 'working', tokens: context.tokens ?? 0, steps: freshSteps(), tick: 0, file: '', words: 0, error: '', note: '' })
   ticker?.cancel()
@@ -409,11 +432,23 @@ async function run($: EngineInterface) {
       $,
       3,
       async () => {
-        const r = await $.model.fork({ prompt: forkPrompt(cwd, g) })
+        let r = await $.model.fork({ prompt: forkPrompt(cwd, g) })
+        // No snapshot to fork (a resumed chat before its first finished turn, or a host
+        // that keeps none): send the transcript as text to the session's own model.
+        if (!r.isAnswered && r.reason === 'nothing-to-fork') {
+          viaTranscript = true
+          await log($, 'nothing to fork, writing from the transcript instead')
+          r = await $.model.complete({
+            model: await $.session.model(),
+            prompt: `${transcriptText(messages)}\n\n---\n\nThe text above is the transcript of this conversation, oldest first (the start may be cut). Read it as the chat you are in.\n\n${forkPrompt(cwd, g)}`,
+            maxTokens: 8000,
+            timeoutMs: 300_000,
+          })
+        }
         writeMs = (await $.clock.now()) - writeStartedAt
         return r
       },
-      r => (r.isAnswered ? `${Math.round(writeMs / 1000)} s` : 'failed'),
+      r => (r.isAnswered ? `${Math.round(writeMs / 1000)} s${viaTranscript ? ', from transcript' : ''}` : 'failed'),
     )
     if (!reply.isAnswered) {
       throw new Error(reply.reason === 'api-error' ? `the model call failed (${reply.status ?? '?'})` : `no handoff came back (${reply.reason})`)
