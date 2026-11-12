@@ -266,6 +266,8 @@ function cluster(on: On, c: Cluster) {
     if (a[0] === 'ssh') return a.some(x => x.startsWith('--query-gpu')) ? ok('0, GPU-a, NVIDIA H200, 97, 72000, 143771, 60, 500, 700\n') : ok('GPU-a, 77, python, 70000\n')
     if (a[0] === 'df') return ok('Mounted on 1B-blocks Used Avail\n/scratch 100 40 60\n')
     if (a[0] === 'sbatch') return ok('3001\n')
+    if (a[0] === 'mkdir') return ok('')
+    if (a[0] === 'cat') return c.files[a[1]!] !== undefined ? ok(c.files[a[1]!]!) : fail
     return fail
   })
   on('fs.stat', (_$, e) => {
@@ -307,7 +309,7 @@ function memStore(on: On, seed: Record<string, unknown> = {}): Map<string, unkno
 
 const startSession = async ($: Engine, on: On, submitted: string[], o: SessionOpts = {}) => {
   const store = memStore(on, o.store)
-  mock.env(on, { USER: 'demo', SLURM_JOB_ID: '10897494' })
+  mock.env(on, { USER: 'demo', HOME: '/home/demo', SLURM_JOB_ID: '10897494' })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'S1' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -724,6 +726,79 @@ test('`: jobs own` from a subagent makes the job that subagent\'s', async ($, on
   expect(r.store.get('owner:2001')).toMatchObject({ sessionId: 'S1', agentId: 'r1', via: 'own' })
   expect(r.sent).toHaveLength(1)
   expect(r.submitted).toEqual([])
+})
+
+test('an alert that resumes a waiting runner ends its wait: its report then is shown', async ($, on) => {
+  const r = await endsOnce($, on, {
+    agents: [{ id: 'r1', status: 'completed' }],
+    before: async () => {
+      await $.tool.call({ tool: 'Bash', command: ': jobs own 2001', agentId: 'r1' } as never)
+      expect(stdoutOf(await $.tool.call({ tool: 'Bash', command: ': jobs wait', agentId: 'r1' } as never))).toContain('End your turn now')
+    },
+  })
+  expect(r.sent).toHaveLength(1)
+  const shown = await $.prompt.submit({ text: handBack('r1', 'Done: 2001 completed, metrics in runs/2001.'), origin: { kind: 'peer' } } as never)
+  expect((shown as { drop?: string }).drop).toBeUndefined()
+  expect(r.submitted.some(t => t.includes('Done: 2001 completed'))).toBe(true)
+})
+
+test('a runner woken by an alert is told to tee its sbatch to its claim file, and what it tees there is its', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const c: Cluster = { squeue: SQUEUE.split('\n').slice(0, 2).join('\n'), sacct: { '2001': COMPLETED_2001 }, ran: [], files: { '/w/runs/slurm-2001.out': LOG } }
+  cluster(on, c)
+  const submitted: string[] = []
+  const sent: { to: unknown; text: string }[] = []
+  const st = await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }], sent, store: { 'owner:2001': { sessionId: 'S1', agentId: 'r1', at: NOW, via: 'sbatch' } } })
+  await clock.settle()
+  c.squeue = SQUEUE.split('\n')[0]!
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(sent).toHaveLength(1)
+  expect(sent[0]!.text).toContain('| tee -a /home/demo/.cache/pace-line/claims/r1')
+  expect(c.ran.some(a => a[0] === 'mkdir' && a[2] === '/home/demo/.cache/pace-line/claims')).toBe(true)
+
+  // Its next sbatch passes no hook; the tee leaves it in the claim file, and it ends before squeue ever lists it.
+  c.files['/home/demo/.cache/pace-line/claims/r1'] = 'Submitted batch job 2001\nSubmitted batch job 2002\n'
+  c.sacct['2002'] = '2002|t4-next|COMPLETED|0:0|0:00:20|/w|sbatch slurm/next.sbatch\n'
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(st.get('owner:2002')).toMatchObject({ sessionId: 'S1', agentId: 'r1', via: 'sbatch' })
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(sent).toHaveLength(2)
+  expect(sent[1]!.text).toContain('t4-next (2002) completed')
+  expect(submitted).toEqual([])
+})
+
+test('a [waiting] hand-back right after a tee\'d sbatch is kept back: the claim file is read first', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const c: Cluster = { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} }
+  cluster(on, c)
+  const submitted: string[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed', type: 'pace-line:job-runner' }], store: { 'owner:2001': { sessionId: 'S1', agentId: 'r1', at: NOW - 3_600_000, via: 'sbatch' } } })
+  await clock.settle()
+  // Resumed by an alert, it tee'd a new sbatch and handed back at once, before any poll.
+  c.files['/home/demo/.cache/pace-line/claims/r1'] = 'Submitted batch job 2002\n'
+  const r = await $.prompt.submit({ text: handBack('r1', '[waiting] 2002 pending; next: report'), origin: { kind: 'peer' } } as never)
+  expect((r as { drop?: string }).drop).toContain('waiting on its jobs')
+  const stop = await $.prompt.submit({ text: '<task-notification>\n<task-id>r1</task-id>\n<status>completed</status>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
+  expect((stop as { drop?: string }).drop).toContain('waiting on its jobs')
+  expect(submitted).toEqual([])
+})
+
+test('reading a claim file or a log does not take its jobs; a claim beats such a capture', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const c: Cluster = { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} }
+  cluster(on, c)
+  const st = await startSession($, on, [], { agents: [{ id: 'r1', status: 'completed' }], bash: 'Submitted batch job 2002\n', store: { 'owner:2001': { sessionId: 'S1', agentId: 'r1', at: NOW, via: 'sbatch' }, 'owner:2003': { sessionId: 'S1', at: NOW, via: 'sbatch' } } })
+  await clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'cat ~/.cache/pace-line/claims/r1' } as never)
+  expect(st.get('owner:2002')).toBeUndefined()
+  c.files['/home/demo/.cache/pace-line/claims/r1'] = 'Submitted batch job 2002\nSubmitted batch job 2003\n'
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(st.get('owner:2002')).toMatchObject({ agentId: 'r1' })
+  expect(st.get('owner:2003')).toMatchObject({ agentId: 'r1' })
 })
 
 test('`: jobs wait` from a runner hides its next hand-back, whatever it says; from the main loop it only explains', async ($, on) => {

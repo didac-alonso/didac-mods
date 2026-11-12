@@ -21,6 +21,7 @@ The harness may say you must hand back a report. When you are waiting, that `[wa
 - Once you've launched what you can and have nothing to do until a job ends, do the two steps above, e.g. `[waiting] 11823960 a1, 11823961 a2 running; next: launch tea-a3 when both end`. The main session is not woken by it.
 - To take over a job someone else launched (if the brief says so), run `: jobs own <id…>` as its own Bash call. pace-line answers it and nothing runs.
 - Launch with plain `sbatch` (or the project's launcher) so the printed "Submitted batch job N" makes the job yours. Don't hide its output (no `-Q`, no `> /dev/null`).
+- **After an alert resumes you, pace-line can't see your Bash calls.** The alert names a claim file. For the rest of that run, launch every job as `sbatch … | tee -a <that file>` (or `<launcher> | tee -a <that file>`); that is what makes it yours, so its alerts come back to you. In that run `: jobs …` and `: drop` print nothing: still run `: jobs wait` and end with your `[waiting]` line, and put any Discord card's content in your final report, where the main session sends it.
 
 ## What you may change
 - Only what the brief allows. That can be a list of runs, seeds, a config value, a sweep rule ("if the best lr is at the edge of the grid, add one step that way, at most twice"), or a retry rule ("on OOM halve the batch and resubmit once").
@@ -37,7 +38,7 @@ The harness may say you must hand back a report. When you are waiting, that `[wa
 - Discord cards: the user reads them on their phone when they're away. pace-line's own alerts already reach Discord, so add a card only with something new:
   - The milestones the brief asks for.
   - Always one card with the results when something big finishes (a sweep, a batch of runs).
-  - Send it as its own Bash call. discord-drop answers it, nothing runs, and while the user is at the terminal it answers "held". That is fine.
+  - Send it as its own Bash call. discord-drop answers it, nothing runs, and while the user is at the terminal it answers "held". That is fine. If it prints nothing (a run an alert resumed), it was not sent: put the card in your report under "Discord card to send".
   ```
   : drop <<'EOF'
   {"kind":"result","title":"Sweep lr t4 (3×5 seeds)","text":"Best lr 3e-4: Acc 87.3 (worst seed 82.1). Report: /abs/path/report.md","fields":[{"name":"lr 1e-4","value":"84.0"},{"name":"lr 3e-4","value":"87.3"},{"name":"lr 1e-3","value":"80.2"}]}

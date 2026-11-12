@@ -32,8 +32,11 @@ const SBATCH = /(?:^|[;&|(`{!\n]|\$\(|\b(?:do|then|else)\s)\s*(?:(?:env|nohup|co
 /** Whether a shell command runs sbatch itself (a wrapper script that does is seen by its printed ids). A `: op` heredoc only mentions it. */
 export const runsSbatch = (command: string) => !/^\s*:\s/.test(command) && SBATCH.test(command)
 
-/** Whether a Bash call's output may name submitted jobs. */
-export const mayHaveIds = (command: string, stdout: string) => stdout.includes('Submitted batch job') || runsSbatch(command)
+/** A command that only reads files or logs: what it prints was submitted earlier, maybe by someone else. */
+const READS = /^\s*(?:cd\s+\S+\s*&&\s*)?(?:cat|head|tail|grep|egrep|rg|less|more|zcat|awk|jq|wc|sed\s+-n)\b/
+
+/** Whether a Bash call's output may name jobs it submitted. */
+export const mayHaveIds = (command: string, stdout: string) => runsSbatch(command) || (stdout.includes('Submitted batch job') && !READS.test(command))
 
 /** Every job id an sbatch call printed: "Submitted batch job N", or bare ids under --parsable. */
 export function submittedIds(command: string, stdout: string): string[] {
@@ -75,12 +78,18 @@ export const JOBS_HELP = [
 
 export const WHOSE_TEXT: Record<Whose, string> = { mine: 'this session', other: 'another session', none: 'nobody' }
 
-/** The prompt for a job-runner (or any subagent) whose job raised alerts. */
-export function runnerText(alerts: string, logs: string[]): string {
+/** Where a subagent woken by an alert writes what it submits: pace-line's hooks don't see the tool calls of an agent a plugin resumed. */
+export const claimFile = (dir: string, agentId: string) => `${dir}/${agentId}`
+
+/** The prompt for a job-runner (or any subagent) whose job raised alerts. `claims` is its claim file. */
+export function runnerText(alerts: string, logs: string[], claims: string | null): string {
   return [
     '[pace-line: alerts for jobs you launched, from the job watcher]',
     alerts,
     logs.length ? `Logs: ${logs.join(', ')}` : '',
+    claims
+      ? `In this run pace-line can't see your Bash calls, so: launch every job as \`sbatch … | tee -a ${claims}\` (or \`<launcher> | tee -a ${claims}\`), which makes it yours and keeps its alerts coming to you; \`: jobs …\` and \`: drop\` get no answer (no output is normal), so put any Discord card's content in your final report instead.`
+      : '',
     'Carry on with your brief. If you launched more jobs and have nothing else to do until they end, run `: jobs wait`, then end your turn with one `[waiting]` line.',
   ].filter(Boolean).join('\n')
 }

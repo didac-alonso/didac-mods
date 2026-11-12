@@ -12,7 +12,7 @@ import { SACCT_FIELDS, SQUEUE_FORMAT, parseDf, parseJobDetail, parseLogTail, par
 import { CONVENTIONS, EMPTY_JOBS, TEMPLATES, configFrom } from './jobs/state'
 import type { WatchConfig } from './jobs/state'
 import { jobsLine, jobsTab } from './jobs/view'
-import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, NOTHING_TO_WAKE, WAIT_NOTHING, WAIT_TEXT, handBackFrom, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
+import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, NOTHING_TO_WAKE, WAIT_NOTHING, WAIT_TEXT, claimFile, handBackFrom, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
 import type { JobsOp, Owner, Whose } from './jobs/owners'
 
 const EMPTY: Snapshot = {
@@ -199,12 +199,18 @@ let ctx: Ctx | null = null
 const waiting = new Set<string>()
 /** This session's id ($.session.id()), which owns the jobs it launched. */
 let me: string | null = null
+/** ~/.cache/pace-line/claims: one file per subagent an alert resumed, holding what it submitted since. */
+let claimsDir: string | null = null
 let polling = false
 let paneOpen = false
 let disksAt = 0
 /** Interactive jobs (srun --pty, salloc) squeue lists but there is nothing to watch in. */
 const ignored = new Set<string>()
 const hostsOf = new Map<string, string[]>()
+/** Subagents an alert resumed: their claim files are read on every poll. */
+const resumedAgents = new Set<string>()
+/** Subagents whose `[waiting]` hand-back was kept back: their next stop notice is too. */
+const quietStop = new Set<string>()
 
 async function run($: EngineInterface, argv: string[], opts: { timeoutMs?: number; cwd?: string } = {}): Promise<string | null> {
   try {
@@ -268,6 +274,8 @@ async function startWatch($: EngineInterface, cfg: WatchConfig, ownJob: string |
   if (!user || (await run($, ['squeue', '--version'], { timeoutMs: 5_000 })) === null) return false
   const z = await run($, ['date', '+%z'], { timeoutMs: 5_000 })
   ctx = { user, ownJob, zone: zoneMinutes(z ?? '+0000'), cfg }
+  const home = await $.env.get('HOME')
+  claimsDir = home ? `${home}/.cache/pace-line/claims` : null
   await forgetOld($)
   await beat($)
   await poll($)
@@ -402,6 +410,7 @@ async function poll($: EngineInterface): Promise<void> {
       await update($, jobsAtom, s => ({ ...s, error: 'squeue did not answer', updatedAt: t }))
       return
     }
+    await readClaims($, t).catch(() => {})
     const rows = parseSqueue(out).filter(r => !cfg.excludeNames.includes(r.name) && r.id !== ownJob && !ignored.has(r.id))
     const prev = (await read($, jobsAtom)).jobs
     const byId = new Map(prev.map(j => [j.id, j]))
@@ -562,15 +571,53 @@ async function recordSbatch($: EngineInterface, command: string, stdout: string,
   // Watched from now, not from the next squeue: a job that starts and ends
   // between two polls is then still found ended (by sacct) and its alert sent.
   // Not an array: its tasks show up in squeue under their own ids.
-  const fresh = ids.filter(id => !before.has(id))
-  if (fresh.length && !/(?:^|\s)(?:--array\b|-a\s)/.test(command)) {
-    await update($, jobsAtom, s => ({ ...s, jobs: [...s.jobs, ...fresh.filter(id => !s.jobs.some(j => baseId(j.id) === id)).map(id => ({ ...newJob(id), submittedAt: t }))] }))
-  }
+  if (!/(?:^|\s)(?:--array\b|-a\s)/.test(command)) await watchNow($, ids.filter(id => !before.has(id)), t)
   if (ids.length || !runsSbatch(command)) return
   // An sbatch that printed no id (quiet, or output sent elsewhere): the job that shows up next is taken to be this caller's.
   const last = ((await $.store.get(LAST_SBATCH)) ?? {}) as Record<string, { at: number; agentId?: string }>
   last[me] = { at: t, ...(agentId ? { agentId } : {}) }
   await $.store.set(LAST_SBATCH, last)
+}
+
+/** Adds jobs to the watch list before squeue lists them. */
+async function watchNow($: EngineInterface, ids: string[], t: number): Promise<void> {
+  if (!ids.length) return
+  await update($, jobsAtom, s => ({ ...s, jobs: [...s.jobs, ...ids.filter(id => !s.jobs.some(j => baseId(j.id) === id)).map(id => ({ ...newJob(id), submittedAt: t }))] }))
+}
+
+/**
+ * The claim files of this session's subagents: what a subagent woken by an
+ * alert submitted (its Bash calls pass no hook), as `sbatch … | tee -a` wrote it.
+ */
+async function readClaims($: EngineInterface, t: number): Promise<void> {
+  if (!me || !claimsDir) return
+  const agents = new Set(resumedAgents)
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(OWNER)) continue
+    const o = (await $.store.get(key)) as Owner | undefined
+    if (o?.sessionId === me && o.agentId) agents.add(o.agentId)
+  }
+  // Only files that exist: one `ls`, not a `cat` per agent ever seen.
+  let files = new Set<string>()
+  try {
+    files = new Set((await $.fs.list(claimsDir)).map(f => f.name))
+  } catch {
+    return // no claim file yet
+  }
+  for (const agentId of agents) {
+    if (!files.has(agentId)) continue
+    const text = await run($, ['cat', claimFile(claimsDir, agentId)], { timeoutMs: 5_000 })
+    if (!text) continue
+    const fresh: string[] = []
+    for (const id of submittedIds('', text)) {
+      const was = await ownerOf($, id)
+      // A claim names the subagent that ran the sbatch: it beats this session's own guess or capture without one.
+      if (was && (was.agentId === agentId || was.sessionId !== me || was.agentId || was.via === 'own' || was.via === 'orphan')) continue
+      await setOwner($, id, { sessionId: me, agentId, at: t, via: 'sbatch' })
+      fresh.push(id)
+    }
+    await watchNow($, fresh, t)
+  }
 }
 
 /** A job nobody claimed, submitted right after exactly one session ran an id-less sbatch, is that session's. */
@@ -672,8 +719,20 @@ async function deliver($: EngineInterface, d: Delivery): Promise<void> {
       const status = agents.find(x => x.id === agentId)?.status
       let isDelivered = false
       if (status !== 'killed' && status !== 'failed') {
+        // Resumed by this alert: what it hands back next is its answer, shown.
+        // (Hooks don't see a send of this plugin's own, nor, it seems, the tool calls of an agent it resumes.)
+        waiting.delete(agentId)
+        const claims = claimsDir ? claimFile(claimsDir, agentId) : null
         try {
-          isDelivered = (await $.session.send({ to: { agentId }, text: runnerText(as.map(a => a.text).join('\n'), logsOf(as)) })).isDelivered
+          if (claimsDir) await run($, ['mkdir', '-p', claimsDir])
+          isDelivered = (await $.session.send({ to: { agentId }, text: runnerText(as.map(a => a.text).join('\n'), logsOf(as), claims) })).isDelivered
+          if (isDelivered && me) {
+            resumedAgents.add(agentId)
+            // If it forgets the tee: a job showing up within 2 min is guessed to be its.
+            const last = ((await $.store.get(LAST_SBATCH)) ?? {}) as Record<string, { at: number; agentId?: string }>
+            last[me] = { at: await $.clock.now(), agentId }
+            await $.store.set(LAST_SBATCH, last)
+          }
         } catch {
           isDelivered = false
         }
@@ -694,6 +753,8 @@ async function deliver($: EngineInterface, d: Delivery): Promise<void> {
 /** Whether a subagent owns a job not ended: running or pending, or submitted in the last 10 min and not polled yet. */
 async function ownsLiveJob($: EngineInterface, agentId: string): Promise<boolean> {
   const t = await $.clock.now()
+  // What it tee'd since the last poll counts: a runner hands back `[waiting]` right after its sbatch.
+  await readClaims($, t).catch(() => {})
   const jobs = (await read($, jobsAtom)).jobs
   for (const key of await $.store.keys()) {
     if (!key.startsWith(OWNER)) continue
@@ -1039,6 +1100,7 @@ export const register: Register = (on, options) => {
     // A waiting subagent's task-notification (it stopped, with or without a hand-back).
     if (e.origin?.kind === 'task-notification') {
       const task = /<task-id>([^<]+)<\/task-id>/.exec(e.text)?.[1]
+      if (task && quietStop.delete(task)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
       if (task && waiting.has(task)) {
         if (await ownsLiveJob($, task)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
         waiting.delete(task)
@@ -1058,7 +1120,11 @@ export const register: Register = (on, options) => {
         const agents = (await $.agent.list()) as { id: string; type: string }[]
         if (agents.find(a => a.id === agentId)?.type !== RUNNER_TYPE) return next(e)
       }
-      if (await ownsLiveJob($, agentId)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
+      if (await ownsLiveJob($, agentId)) {
+        // Its stop notice, which follows, is kept back too (only that: its next hand-back is shown).
+        quietStop.add(agentId)
+        return { drop: 'pace-line: the subagent is waiting on its jobs' }
+      }
       waiting.delete(agentId)
       return next({ ...e, context: [...(e.context ?? []), NOTHING_TO_WAKE] })
     }
