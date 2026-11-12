@@ -8,7 +8,7 @@ import { braille, fmtNum, sparkline } from './jobs/chart'
 import { EMPTY_METRICS, addChunk, ckptNumbers, ema, etaSeconds, lossKey, newestCkpt, trend, utf8Length, valKeys } from './jobs/metrics'
 import { gpusFromTres, parseDf, parseJobDetail, parseLogTail, parseSacct, parseSqueue, resumeArgv, shellWords, slurmTime, submittedId, zoneMinutes } from './jobs/parse'
 import { items, jobsLine, progressText } from './jobs/view'
-import { baseId, jobsOp, runsSbatch, submittedIds, whose } from './jobs/owners'
+import { baseId, jobsOp, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
 
 const NOW = Date.parse('2026-10-07T18:00:00Z')
 
@@ -282,7 +282,7 @@ function cluster(on: On, c: Cluster) {
 
 type SessionOpts = {
   store?: Record<string, unknown>
-  agents?: { id: string; status: string }[]
+  agents?: { id: string; status: string; type?: string }[]
   sent?: { to: unknown; text: string }[]
   toasts?: string[]
   /** What a Bash call prints beneath pace-line (an sbatch, for the capture). */
@@ -315,12 +315,13 @@ const startSession = async ($: Engine, on: On, submitted: string[], o: SessionOp
   on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('settings.read', () => ({ value: {} }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
-  on('agent.list', () => ({ value: (o.agents ?? []).map(a => ({ ...a, type: 'pace-line:job-runner', description: 'runner' })) as never }))
+  on('agent.list', () => ({ value: (o.agents ?? []).map(a => ({ type: 'pace-line:job-runner', description: 'runner', ...a })) as never }))
   on('session.send', (_$, e) => {
     o.sent?.push({ to: e.to, text: e.text })
     return { isDelivered: true }
   })
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: o.bash ?? '', stderr: '', interrupted: false } }))
+  on('agent.spawn', (_$, e) => ({ model: 'claude-sonnet-5-5', agentId: (e as { resume?: { agentId?: string } }).resume?.agentId ?? 'new' }) as never)
   on('prompt.submit', (_$, e) => {
     submitted.push(e.text)
     return { text: e.text }
@@ -653,4 +654,99 @@ test('an unowned job\'s toast says how to take it, and the panel\'s Take button 
   await clock.settle()
   expect(submitted).toHaveLength(1)
   expect(toasts.some(t => t.includes('/jobs own'))).toBe(false)
+})
+
+// ── job-runner: a `[waiting]` hand-back doesn't wake the main session ─────
+
+const handBack = (agentId: string, report: string) =>
+  `<agent-message from="${agentId}">\n[Subagent hand-back] The text below is the final report of a subagent this session delegated to.\n${report.split('\n').map(l => `  ${l}`).join('\n')}\n</agent-message>`
+
+test('waitingFrom: a hand-back whose report has a [waiting] line', () => {
+  expect(waitingFrom(handBack('a1', 'Launched a1, a2.\n[waiting] 3001, 3002 running; next: tea-a3'))).toBe('a1')
+  expect(waitingFrom(handBack('a1', 'All done: table below. Not [waiting] anymore.'))).toBeNull()
+  expect(waitingFrom('[waiting] typed by someone')).toBeNull()
+  // A real report that ends with `[waiting]` for the jobs still running is shown.
+  expect(waitingFrom(handBack('a1', 'a2 FAILED: CUDA OOM at step 1200, outside the brief.\n| run | state |\n| a1 | RUNNING |\n| a2 | FAILED |\n[waiting] a1 running'))).toBeNull()
+  // Two hand-backs batched in one prompt: shown.
+  expect(waitingFrom(handBack('a1', '[waiting] x') + '\n' + handBack('a2', 'real report'))).toBeNull()
+})
+
+test('a job-runner\'s [waiting] hand-back is dropped; its report, and other agents\' [waiting], are not', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
+  const submitted: string[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }, { id: 'g1', status: 'completed', type: 'general-purpose' }] })
+  await clock.settle()
+  const peer = (text: string) => $.prompt.submit({ text, origin: { kind: 'peer' } } as never)
+
+  const waiting = await peer(handBack('r1', '[waiting] 3001 running; next: a2'))
+  expect((waiting as { drop?: string }).drop).toContain('waiting on its jobs')
+  expect(submitted).toEqual([])
+
+  await peer(handBack('r1', 'Sweep done.\n| lr | Acc |\n| 3e-4 | 87.3 |'))
+  await peer(handBack('g1', '[waiting] something else'))
+  expect(submitted).toHaveLength(2)
+})
+
+test('`: jobs own` from a subagent makes the job that subagent\'s', async ($, on) => {
+  const r = await endsOnce($, on, {
+    agents: [{ id: 'r1', status: 'completed' }],
+    before: async () => {
+      const out = await $.tool.call({ tool: 'Bash', command: ': jobs own 2001', agentId: 'r1' } as never)
+      expect(stdoutOf(out)).toContain('Owned by this subagent now: 2001')
+    },
+  })
+  expect(r.store.get('owner:2001')).toMatchObject({ sessionId: 'S1', agentId: 'r1', via: 'own' })
+  expect(r.sent).toHaveLength(1)
+  expect(r.submitted).toEqual([])
+})
+
+test('`: jobs wait` from a runner hides its next hand-back, whatever it says; from the main loop it only explains', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
+  const submitted: string[] = []
+  const sent: { to: unknown; text: string }[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }], sent, store: { 'owner:3001': { sessionId: 'S1', agentId: 'r1', at: NOW, via: 'sbatch' } } })
+  await clock.settle()
+  const bash = (command: string, agentId?: string) => $.tool.call({ tool: 'Bash', command, ...(agentId ? { agentId } : {}) } as never)
+  const peer = (text: string) => $.prompt.submit({ text, origin: { kind: 'peer' } } as never)
+
+  expect(stdoutOf(await bash(': jobs wait'))).toContain('is for a subagent')
+  expect(stdoutOf(await bash(': jobs wait', 'r1'))).toContain('End your turn now')
+  // The model wrote a hand-off anyway, and its stop notice follows: both kept from the main session.
+  await peer(handBack('r1', 'INCOMPLETE: the harness required a hand-back. Job 3001 is PENDING.'))
+  await $.prompt.submit({ text: '<task-notification>\n<task-id>r1</task-id>\n<status>completed</status>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
+  expect(submitted).toEqual([])
+  // An alert (or any message) resumes it: what it answers then is shown.
+  await $.session.send({ to: { agentId: 'r1' }, text: 'alert' } as never)
+  await peer(handBack('r1', 'Done: 3001 COMPLETED, value 42.'))
+  await $.prompt.submit({ text: '<task-notification>\n<task-id>r1</task-id>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
+  expect(submitted).toHaveLength(2)
+})
+
+test('`: jobs wait` is refused to a runner with no live job, and any later work, or a resume by name, ends the wait', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
+  const submitted: string[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }, { id: 'r2', status: 'completed' }], store: { 'owner:3002': { sessionId: 'S1', agentId: 'r2', at: NOW, via: 'sbatch' } } })
+  await clock.settle()
+  const bash = (command: string, agentId?: string) => $.tool.call({ tool: 'Bash', command, ...(agentId ? { agentId } : {}) } as never)
+  const peer = (text: string) => $.prompt.submit({ text, origin: { kind: 'peer' } } as never)
+
+  // r1 owns nothing: nothing would resume it.
+  expect(stdoutOf(await bash(': jobs wait', 'r1'))).toContain('you own no running or pending job')
+  await peer(handBack('r1', 'INCOMPLETE: hand-back required.'))
+  expect(submitted).toHaveLength(1)
+
+  // r2 waits, then goes on working and finds a problem: its report is shown.
+  expect(stdoutOf(await bash(': jobs wait', 'r2'))).toContain('End your turn now')
+  await bash('df -h /scratch', 'r2')
+  await peer(handBack('r2', 'Disk quota exceeded on /scratch: stopping.'))
+  expect(submitted).toHaveLength(2)
+
+  // r2 waits again; the main session resumes it by name (a resume spawn): its answer is shown.
+  await bash(': jobs wait', 'r2')
+  await $.agent.spawn({ tool_use_id: 'toolu_plugin_1', prompt: 'status?', description: 'runner', subagentType: 'pace-line:job-runner', background: true, resume: { agentId: 'r2' } } as never)
+  await peer(handBack('r2', 'Status: 3002 RUNNING, epoch 3/10.'))
+  expect(submitted).toHaveLength(3)
 })
