@@ -1,6 +1,6 @@
 {
   "name": "discord-drop",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Discord cards through a webhook, only when you're away: results with plots, finished tasks, failed jobs, questions waiting for you. Silent while you work with Claude.",
   "author": {
     "name": "Dídac"
@@ -24,6 +24,13 @@
       "type": "boolean",
       "title": "Safety net",
       "description": "When a long stretch of work ends while you're away and Claude sent nothing, send a short 'done' card.",
+      "required": false,
+      "default": true
+    },
+    "jobCards": {
+      "type": "boolean",
+      "title": "Job progress cards",
+      "description": "A silent Discord card per launch of this session's batch jobs, edited as they run; the results Claude sends with \"card\" replace it.",
       "required": false,
       "default": true
     },

@@ -25,6 +25,8 @@ export type Drop = {
   final: boolean
   /** The user asked for it: it goes out whether they're here or not. */
   force: boolean
+  /** A job id: these results replace that job's progress card. */
+  card: string | null
   author: string | null
   footer: string | null
 }
@@ -94,6 +96,8 @@ export function dropFrom(raw: Raw): Drop | string {
   let eta = num(raw.eta)
   if (eta !== null && eta > 1e12) eta = Math.round(eta / 1000)
   if (kind === 'progress' && !key) return 'discord-drop: a progress card needs a key, so later updates edit it.'
+  const card = str(raw.card)
+  if (card && !/^\d+(?:[_+][\w\[\]-]+)?$/.test(card)) return `discord-drop: card is a job id (e.g. "11823960"), got ${cut(card, 40)}.`
   return {
     kind,
     title,
@@ -107,6 +111,7 @@ export function dropFrom(raw: Raw): Drop | string {
     eta,
     final: raw.final === true,
     force: raw.force === true,
+    card: card || null,
     author: str(raw.author) || null,
     footer: str(raw.footer) || null,
   }

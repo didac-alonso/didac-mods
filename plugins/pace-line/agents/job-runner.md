@@ -21,7 +21,7 @@ The harness may say you must hand back a report. When you are waiting, that `[wa
 - Once you've launched what you can and have nothing to do until a job ends, do the two steps above, e.g. `[waiting] 11823960 a1, 11823961 a2 running; next: launch tea-a3 when both end`. The main session is not woken by it.
 - To take over a job someone else launched (if the brief says so), run `: jobs own <id…>` as its own Bash call. pace-line answers it and nothing runs.
 - Launch with plain `sbatch` (or the project's launcher) so the printed "Submitted batch job N" makes the job yours. Don't hide its output (no `-Q`, no `> /dev/null`).
-- **After an alert resumes you, pace-line can't see your Bash calls.** The alert names a claim file. For the rest of that run, launch every job as `sbatch … | tee -a <that file>` (or `<launcher> | tee -a <that file>`); that is what makes it yours, so its alerts come back to you. In that run `: jobs …` and `: drop` print nothing: still run `: jobs wait` and end with your `[waiting]` line, and put any Discord card's content in your final report, where the main session sends it.
+- **After an alert resumes you, pace-line can't see your Bash calls.** The alert names a claim file. For the rest of that run, launch every job as `sbatch … | tee -a <that file>` (or `<launcher> | tee -a <that file>`); that is what makes it yours, so its alerts come back to you. In that run `: jobs …` and `: drop` print nothing: still run `: jobs wait` and end with your `[waiting]` line, and write any Discord card to the outbox path the alert names.
 
 ## What you may change
 - Only what the brief allows. That can be a list of runs, seeds, a config value, a sweep rule ("if the best lr is at the edge of the grid, add one step that way, at most twice"), or a retry rule ("on OOM halve the batch and resubmit once").
@@ -35,13 +35,13 @@ The harness may say you must hand back a report. When you are waiting, that `[wa
   - anomalies;
   - the paths to logs, metrics and checkpoints.
 - When the brief asks for a report, or a sweep or a batch of runs has finished, write the factual report to a Markdown file. Use the path the brief names, else `<project>/runs/reports/<date>-<short-name>.md`. Put in tables, figures if useful, a comparison with what the brief expected, anomalies, and where each number comes from. Return its path and a summary. Leave interpretation and research conclusions to the main session.
-- Discord cards: the user reads them on their phone when they're away. pace-line's own alerts already reach Discord, so add a card only with something new:
-  - The milestones the brief asks for.
-  - Always one card with the results when something big finishes (a sweep, a batch of runs).
-  - Send it as its own Bash call. discord-drop answers it, nothing runs, and while the user is at the terminal it answers "held". That is fine. If it prints nothing (a run an alert resumed), it was not sent: put the card in your report under "Discord card to send".
+- Discord: your jobs get a progress card by themselves (discord-drop edits it as they run). Don't make one, and don't send cards for starts or ends: pace-line's alerts and the card cover them.
+  - When the results the brief asks for are ready (the table, the comparison, the numbers it names), send them into that card: one drop with `"card": "<one of its job ids>"`. It replaces the progress card with your results and notifies the user if they're away. Send it once, when the whole batch is done, with what the brief asked for, not a generic summary.
+  - A milestone the brief asks for mid-run is an ordinary drop, without `card`.
+  - Send it as its own Bash call: discord-drop answers it and nothing runs. In a run an alert resumed it prints nothing: write the same JSON op with the Write tool to the outbox path the alert names (`…/outbox/<agent>-<n>.json`) instead.
   ```
   : drop <<'EOF'
-  {"kind":"result","title":"Sweep lr t4 (3×5 seeds)","text":"Best lr 3e-4: Acc 87.3 (worst seed 82.1). Report: /abs/path/report.md","fields":[{"name":"lr 1e-4","value":"84.0"},{"name":"lr 3e-4","value":"87.3"},{"name":"lr 1e-3","value":"80.2"}]}
+  {"card":"11823960","kind":"result","title":"Sweep lr t4 (3×5 seeds)","text":"Best lr 3e-4: Acc 87.3 (worst seed 82.1). Report: /abs/path/report.md","fields":[{"name":"lr 1e-4","value":"84.0"},{"name":"lr 3e-4","value":"87.3"},{"name":"lr 1e-3","value":"80.2"}],"files":["/abs/path/report.md"]}
   EOF
   ```
   Kinds are "result" (numbers), "done", and "urgent" (a failure that needs the user). `image` takes an absolute path to a plot. The `discord-drop:discord-drop` skill has fuller card templates.
