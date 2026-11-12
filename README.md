@@ -10,7 +10,7 @@ Claude Code mods for working on a Slurm GPU cluster.
 | [discord-drop](plugins/discord-drop) | Discord cards through a webhook, only when you're away: results with their plots, finished tasks, failed or finished batch jobs, questions and permission prompts waiting for you. Silent while you work with Claude. |
 | [dev-relay](plugins/dev-relay) | Keeps the dev-shell alive past Slurm's time limit: a successor job takes over, every Claude session resumes in its herdr pane on the new node, and the ones that were working carry on. |
 | [job-watch](plugins/job-watch) | For your laptop, not the cluster: the same job watcher over one `ssh <host> bash -s` a minute, with hoverable loss, val, GPU-history and sweep charts in the desktop app. Needs an ssh alias that logs in without a prompt. |
-| [handoff](plugins/handoff) | When the chat gets big, offers Refresh: writes a handoff of the whole chat, then runs `/clear` and leaves the handoff in the prompt box for you to send. It can also copy it or open a new chat with it. |
+| [handoff](plugins/handoff) | When the chat gets big, offers Refresh: writes a handoff of the whole chat, then runs `/clear` and leaves the handoff in the prompt box for you to send. It can also copy it or open a new chat with it. Based on the handoff mod in Ben AI's token-saving-mods pack. |
 
 ## Install
 
