@@ -30,6 +30,10 @@ export type PaceJob = {
   endedAt?: number | null
   /** A k/n count from the log (tqdm and the like). */
   progress?: { k: number; n: number } | null
+  /** The last loss its log printed, when it writes no metrics file. */
+  logLoss?: { key: string; value: number } | null
+  /** Seconds per iteration, as its log prints it. */
+  secPerIt?: number | null
   /** Whose Claude gets its alerts, seen from this session. */
   owner?: 'mine' | 'other' | 'none'
   /** When it is this session's: the subagent that launched it, or null. */

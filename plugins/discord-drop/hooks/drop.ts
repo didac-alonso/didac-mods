@@ -95,8 +95,8 @@ export function dropFrom(raw: Raw): Drop | string {
   if (progress !== null) progress = Math.max(0, Math.min(1, progress > 1 ? progress / 100 : progress))
   let eta = num(raw.eta)
   if (eta !== null && eta > 1e12) eta = Math.round(eta / 1000)
-  if (kind === 'progress' && !key) return 'discord-drop: a progress card needs a key, so later updates edit it.'
   const card = str(raw.card)
+  if (kind === 'progress' && !key && !card) return 'discord-drop: a progress card needs a key, so later updates edit it.'
   if (card && !/^\d+(?:[_+][\w\[\]-]+)?$/.test(card)) return `discord-drop: card is a job id (e.g. "11823960"), got ${cut(card, 40)}.`
   return {
     kind,

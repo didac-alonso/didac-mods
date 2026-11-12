@@ -153,21 +153,36 @@ const NOISE = [
   /^\s*\d+%\|/, // a tqdm bar with no description: kept as progress, not as a line
 ]
 
-export type LogTail = { lines: string[]; progress: { k: number; n: number } | null; flags: LogFlags }
+/** A loss the log prints itself (`train_loss 2.63`, `loss=0.41`), for jobs that write no metrics file. */
+export type LogLoss = { key: string; value: number }
+
+export type LogTail = { lines: string[]; progress: { k: number; n: number } | null; loss: LogLoss | null; secPerIt: number | null; flags: LogFlags }
+
+// `it 300/2000`, `iter 300/2000`, `step: 300/2000`: a training loop's own count.
+const ITER = /\b(?:it|iter|iteration|step)s?\s*[:=]?\s*(\d+)\s*\/\s*(\d+)\b/i
+const LOSS = /\b((?:train|val|eval|valid|test)?[_/]?loss)\s*[=:]?\s*(-?\d+(?:\.\d+)?(?:e[-+]?\d+)?)\b/i
+const SPEED = /(\d+(?:\.\d+)?)\s*(ms|s)\/it\b|(\d+(?:\.\d+)?)\s*it\/s\b/
 
 /**
  * The tail of a job's log: tqdm's carriage returns split into lines, noise
- * dropped, the last `[k/N]` or tqdm `k/N [` as progress, and trouble flagged.
+ * dropped, the last `[k/N]`, tqdm `k/N [` or `it k/N` as progress, the last
+ * loss and speed (ms/it, s/it, it/s) the log prints, and trouble flagged.
  */
 export function parseLogTail(text: string, keep = 3): LogTail {
   const raw = text.replace(/\r\n/g, '\n').split(/[\r\n]/)
   let progress: { k: number; n: number } | null = null
+  let loss: LogLoss | null = null
+  let secPerIt: number | null = null
   const flags: LogFlags = { oom: null, traceback: null, nccl: null, srun: null }
   let inTraceback = false
   for (let i = 0; i < raw.length; i++) {
     const line = raw[i]!
-    const p = /\[(\d+)\/(\d+)\]/.exec(line) ?? /\b(\d+)\/(\d+) \[/.exec(line)
+    const p = /\[(\d+)\/(\d+)\]/.exec(line) ?? /\b(\d+)\/(\d+) \[/.exec(line) ?? ITER.exec(line)
     if (p && Number(p[2]) > 0) progress = { k: Number(p[1]), n: Number(p[2]) }
+    const l = LOSS.exec(line)
+    if (l && Number.isFinite(Number(l[2]))) loss = { key: l[1]!.toLowerCase(), value: Number(l[2]) }
+    const v = SPEED.exec(line)
+    if (v) secPerIt = v[3] !== undefined ? 1 / Number(v[3]) : Number(v[1]) / (v[2] === 'ms' ? 1000 : 1)
     if (/CUDA out of memory|OutOfMemoryError|oom-kill|Out Of Memory/i.test(line)) flags.oom = line.trim()
     if (/NCCL (error|WARN.*[Tt]imeout)|Watchdog caught collective operation timeout|ProcessGroupNCCL.*(timeout|error)/i.test(line)) flags.nccl = line.trim()
     if (/^srun: error:/.test(line)) flags.srun = line.trim()
@@ -179,7 +194,7 @@ export function parseLogTail(text: string, keep = 3): LogTail {
     }
   }
   const lines = raw.filter(l => !NOISE.some(r => r.test(l))).map(l => l.trimEnd()).slice(-keep)
-  return { lines, progress, flags }
+  return { lines, progress, loss, secPerIt: secPerIt !== null && Number.isFinite(secPerIt) && secPerIt > 0 ? secPerIt : null, flags }
 }
 
 /** Splits a command line as a POSIX shell would for plain words, quotes and escapes. */

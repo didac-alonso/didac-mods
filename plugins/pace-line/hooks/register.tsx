@@ -307,6 +307,8 @@ async function readFiles($: EngineInterface, j: BatchJob): Promise<BatchJob> {
           ...out,
           lastLines: t.lines,
           progress: t.progress ?? out.progress,
+          logLoss: t.loss ?? out.logLoss ?? null,
+          secPerIt: t.secPerIt ?? out.secPerIt ?? null,
           // Sticky: an error scrolled out of the tail still happened.
           flags: {
             oom: t.flags.oom ?? out.flags.oom,

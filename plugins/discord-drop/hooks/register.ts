@@ -7,7 +7,7 @@ import { adoptedSuccessor, cut, dropFrom, fmtDur, isAway, latestUserAt, MAX_FILE
 import type { Drop, Field, Kind, Route } from './drop'
 import { attachments, baseOf, card, curlConfig, deleteArgv, failure, messageUrl, parseCurl, patchArgv, payload, postArgv, postUrl, STRINGS, tookField } from './embed'
 import { cardDrop, cardOf, EDIT_MS, refresh } from './jobcards'
-import type { JobCard } from './jobcards'
+import type { CardNote, JobCard } from './jobcards'
 import type { Lang, Strings } from './embed'
 
 type Raw = Record<string, unknown>
@@ -32,7 +32,7 @@ The user reads Discord on their phone. A card reaches them only when they're awa
 - Long work you can follow: kind "progress" with a key, progress 0-1 and eta (unix seconds); the same key edits the same card without a sound; final:true closes it and announces the end.
 - "force": true only when the user asked to be messaged.
 - pace-line's batch-job alerts already reach Discord through this mod: drop about a job only to add something (a diagnosis and a fix).
-- Batch jobs this session (or a subagent of it) launches get a progress card by themselves, one per launch, edited as they run. Don't make one. When the results the user asked for are ready (their table, comparison or numbers, not a generic summary), send them into it: add "card": "<one of its job ids>" to the drop. They replace the progress card, silently while the user is here, with a notification when they're away.
+- Batch jobs this session (or a subagent of it) launches get a progress card by themselves, one per launch: counts, a line per job, the total ETA, edited as they run. Don't make another. Right after launching a batch, name it and say in a line or two what it is, in the user's language: kind "progress", "card": "<one of its job ids>", a title ("Grid 3T (tempo users)") and a text ("210 runs: 3 variants × 14 subjects × 5 seeds"). When the results the user asked for are ready (their table, comparison or numbers, not a generic summary), send them into it: a result drop with "card". They replace the progress card, silently while the user is here, with a notification when they're away.
 - Never write the webhook URL in a command. The discord-drop skill has card templates (eval, paper figures, sweeps, datasets, reproducibility).
 : drop <<'EOF'
 {"kind":"result","title":"Eval COCO val2017","text":"mAP 43.0, +1.8 over the baseline","fields":[{"name":"mAP","value":"43.0"},{"name":"baseline","value":"41.2"},{"name":"Δ","value":"+1.8"}],"image":"/abs/path/pr_curve.png"}
@@ -362,6 +362,7 @@ async function bridge($: EngineInterface): Promise<void> {
 /** Alerts a job's progress card already tells. */
 const ROUTINE = new Set(['started', 'ended', 'pending', 'resumed'])
 const cardsKey = () => `cards:${env.sessionId}`
+const notesKey = () => `cardNotes:${env.sessionId}`
 let cardSeq = 0
 
 async function loadCards($: EngineInterface): Promise<JobCard[]> {
@@ -388,12 +389,14 @@ async function jobCards($: EngineInterface): Promise<void> {
   if (!mine.length && !saved.length) return
   if (!(await webhook($))) return
   const now = await $.clock.now()
-  const cards = refresh(saved, mine, cfg.lang, now, () => `jobs-${env.sessionId.slice(0, 8)}-${now.toString(36)}-${cardSeq++}`)
+  const notes = ((await $.store.get(notesKey())) as Record<string, CardNote> | undefined) ?? {}
+  const cards = refresh(saved, mine, cfg.lang, now, () => `jobs-${env.sessionId.slice(0, 8)}-${now.toString(36)}-${cardSeq++}`, notes)
   for (const c of cards) {
     if (c.reportedAt !== null) continue
-    const d = cardDrop(c, cfg.lang)
-    const shown = JSON.stringify([d.title, d.text, d.progress === null ? null : Math.round(d.progress * 100), d.eta])
-    const ended = c.rows.filter(r => r.isEnded).length
+    const d = cardDrop(c, cfg.lang, now)
+    // the ETA in 5-minute steps: Discord draws its countdown
+    const shown = JSON.stringify([d.title, d.text, d.progress === null ? null : Math.round(d.progress * 100), d.eta === null ? null : Math.round(d.eta / 300)])
+    const ended = c.rows.filter(r => r.state === 'ok' || r.state === 'failed').length
     if (!c.msgId) {
       const r = await post($, d, true)
       if (r.ok && r.id) Object.assign(c, { msgId: r.id, shown, editedAt: now, endedShown: ended })
@@ -403,15 +406,31 @@ async function jobCards($: EngineInterface): Promise<void> {
     }
   }
   await $.store.set(cardsKey(), cards)
+  // notes are kept a day, for a card that shows up late
+  const fresh = Object.fromEntries(Object.entries(notes).filter(([, n]) => now - n.at < 86400_000))
+  if (Object.keys(fresh).length !== Object.keys(notes).length) await $.store.set(notesKey(), fresh)
 }
 
 /** Results with "card": they replace that job's progress card (a new message, so it can notify). Null when no card holds the job. */
 async function intoCard($: EngineInterface, drop: Drop, away: boolean, now: number): Promise<string | null> {
   const cards = await loadCards($)
   const c = cardOf(cards, drop.card!)
+  // kind "progress": a name and a description for the card, which keeps updating by itself
+  if (drop.kind === 'progress') {
+    const note: CardNote = { title: drop.title || null, about: drop.text || null, at: now }
+    if (c && c.reportedAt === null) {
+      Object.assign(c, { title: note.title ?? c.title, about: note.about ?? c.about, shown: null, editedAt: 0 })
+      await $.store.set(cardsKey(), cards)
+      return "drop: the jobs' progress card now has this title and description; its counts, lines and ETA keep updating by themselves"
+    }
+    const notes = ((await $.store.get(notesKey())) as Record<string, CardNote> | undefined) ?? {}
+    notes[drop.card!] = note
+    await $.store.set(notesKey(), notes)
+    return "drop: noted; the jobs' progress card gets this title and description when it appears (pace-line lists the job within a minute)"
+  }
   if (!c) return null
   const isSilent = !(away || drop.force)
-  const r = await post($, { ...drop, kind: drop.kind === 'progress' ? 'result' : drop.kind, key: null, progress: null, eta: null, final: false, card: null }, isSilent)
+  const r = await post($, { ...drop, key: null, progress: null, eta: null, final: false, card: null }, isSilent)
   if (!r.ok) return r.message
   if (c.msgId) await remove($, c.msgId)
   Object.assign(c, { reportedAt: now, msgId: null })
@@ -661,7 +680,7 @@ export const register: Register = (on, options) => {
       const open = ids.map(id => [id, cardOf(cards, id)] as const).filter(([, c]) => c && c.reportedAt === null)
       if (open.length) {
         const [id, c] = open[0]!
-        const left = c!.rows.filter(r => !r.isEnded).length
+        const left = c!.rows.filter(r => r.state === 'queued' || r.state === 'running').length
         const hint = left
           ? `discord-drop: ${id} is on a Discord progress card with ${left} job${left === 1 ? '' : 's'} still running; it updates by itself.`
           : `discord-drop: every job on ${id}'s Discord progress card has ended. Once you have the results the user asked for (their table, comparison or numbers), send them into it: one drop with "card": "${id}". It replaces the progress card and notifies them if they're away.`

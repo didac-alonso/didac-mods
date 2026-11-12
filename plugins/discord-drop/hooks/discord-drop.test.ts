@@ -486,19 +486,48 @@ describe('job cards', () => {
 
   test('a card shows a line per job, the shared progress and ETA, and waits for the results', () => {
     const cards = refresh([], [run('3001', 'sweep-lr1e-4'), run('3002', 'sweep-lr3e-4', { state: 'PENDING', metrics: null })], 'es', NOW, () => 'k')
-    const d = cardDrop(cards[0]!, 'es')
+    const d = cardDrop(cards[0]!, 'es', NOW)
     expect(d.title).toBe('sweep · 2 jobs')
+    expect(d.text).toContain('**1 corriendo · 1 en cola')
     expect(d.text).toContain('▶ `lr1e-4` paso 100/400 · loss')
     expect(d.text).toContain('⏸ `lr3e-4` en cola')
     expect(d.progress).toBe(0.125)
-    expect(d.eta).toBe(null) // one is still queued
+    // 30 min left on the running one, then the queued one at its pace (40 min a job)
+    expect(d.eta).toBe(Math.round(NOW / 1000 + 1800 + 2400))
     const done = refresh(cards, [run('3001', 'sweep-lr1e-4', { state: 'COMPLETED', endedAt: NOW }), run('3002', 'sweep-lr3e-4', { state: 'FAILED', endedAt: NOW })], 'es', NOW, () => 'k')
-    const e = cardDrop(done[0]!, 'es')
+    const e = cardDrop(done[0]!, 'es', NOW)
     expect(e.text).toContain('✓ `lr1e-4` terminó')
     expect(e.text).toContain('✗ `lr3e-4` falló')
     expect(e.text).toContain('resultados que pediste llegarán aquí')
     expect(e.progress).toBe(1)
     expect(commonPrefix(['a', 'b'])).toBe('')
+  })
+
+  test('a log-only job shows its it k/N, loss and speed; the total ETA comes from the jobs that ended', () => {
+    const logJob = (id: string, name: string, over: Partial<PaceJob>) => run(id, name, { metrics: null, progress: { k: 300, n: 2000 }, logLoss: { key: 'train_loss', value: 3.97 }, secPerIt: 3.6, elapsedS: 1200, ...over })
+    const jobs = [
+      logJob('5001', 'p3t-tempo-pinwheels-a2', { state: 'COMPLETED', endedAt: NOW, elapsedS: 3120 }),
+      logJob('5002', 'p3t-tempo-pinwheels-a5', { elapsedS: 2820 }),
+      logJob('5003', 'p3t-tempo-pinwheels-ak', {}),
+      logJob('5004', 'p3t-tempo-tea-a2', { state: 'PENDING', progress: null, logLoss: null, secPerIt: null, elapsedS: 0 }),
+      logJob('5005', 'p3t-tempo-tea-a3', { state: 'PENDING', progress: null, logLoss: null, secPerIt: null, elapsedS: 0 }),
+      logJob('5006', 'p3t-tempo-tea-ak', { state: 'PENDING', progress: null, logLoss: null, secPerIt: null, elapsedS: 0 }),
+    ]
+    const c = refresh([], jobs, 'es', NOW, () => 'k')[0]!
+    const d = cardDrop(c, 'es', NOW)
+    expect(d.text).toContain('**2 corriendo · 3 en cola · 1 terminado · ~52 min/job**')
+    expect(d.text).toContain('▶ `pinwheels-ak` it 300/2000 · train_loss 3.97 · 3.6 s/it · 20 min')
+    // ak has 32 min left by the ones that ended (52 − 20), its own count says 1.7 h: the longer; then 3 queued, 2 at a time
+    expect(d.eta).toBe(Math.round(NOW / 1000 + 1700 * 3.6 + 2 * 3120))
+    expect(d.text).toContain('ETA total estimada con 52 min por job y 2 a la vez')
+  })
+
+  test('Claude\'s title and description head the card, even when sent before it existed', () => {
+    const notes = { '6001': { title: 'Grid 3T (usuarios de tempo)', about: '210 runs: 3 variantes × 14 sujetos × 5 semillas', at: NOW } }
+    const c = refresh([], [run('6001', 'p3t-a'), run('6002', 'p3t-b')], 'es', NOW, () => 'k', notes)[0]!
+    const d = cardDrop(c, 'es', NOW)
+    expect(d.title).toBe('Grid 3T (usuarios de tempo)')
+    expect(d.text.startsWith('210 runs: 3 variantes × 14 sujetos × 5 semillas\n**2 corriendo')).toBe(true)
   })
 
   test('a job that ended long before any card is left alone', () => {
@@ -608,4 +637,26 @@ test('an alert that comes before the card\'s next refresh still sees its jobs en
   jobs = [run('3001', 'train', { state: 'COMPLETED', endedAt: NOW + 16_000 })]
   await $.prompt.submit({ text: '[pace-line: batch-job alerts, from the job watcher, not typed by the user]\n✓ train (3001) completed after 2h', origin: { kind: 'plugin' }, wait: false } as never)
   expect(w.contexts.at(-1)?.some(c => c.includes('every job') && c.includes('"card": "3001"'))).toBe(true)
+})
+
+test('a progress drop with "card" names and describes the card, before or after it appears', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  let jobs: PaceJob[] = []
+  paceState(on, () => jobs)
+  await begin($)
+  await say($)
+  // sent right after sbatch, before pace-line lists the job
+  expect(out(await dropCall($, { card: '7001', kind: 'progress', title: 'Grid 3T', text: '210 runs' }))).toContain('noted')
+  jobs = [run('7001', 'p3t-a')]
+  await clock.advance(16_000)
+  const first = posted(w)[0]!.body.embeds as { title: string; description: string }[]
+  expect(first[0]!.title).toContain('Grid 3T')
+  expect(first[0]!.description).toContain('210 runs')
+  // a new description: edited at the next pass, without waiting the minute
+  expect(out(await dropCall($, { card: '7001', kind: 'progress', text: '210 runs; tea y quesadilla esperan cola' }))).toContain('keep updating')
+  await clock.advance(16_000)
+  const p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['POST', 'PATCH'])
+  expect(JSON.stringify(p[1]!.body)).toContain('esperan cola')
 })
