@@ -78,7 +78,7 @@ describe('parse', () => {
 
   test('sacct: a submit line that spans lines and holds pipes', () => {
     const a = parseSacct("2001|t4-train|TIMEOUT|0:0|1-00:00:12|/w|sbatch --export=ALL,X=1 slurm/train.sbatch\n")
-    expect(a).toEqual({ jobId: '2001', state: 'TIMEOUT', exitCode: '0:0', elapsedS: 86412, workDir: '/w', submitLine: 'sbatch --export=ALL,X=1 slurm/train.sbatch' })
+    expect(a).toEqual({ jobId: '2001', name: 't4-train', state: 'TIMEOUT', exitCode: '0:0', elapsedS: 86412, workDir: '/w', submitLine: 'sbatch --export=ALL,X=1 slurm/train.sbatch' })
     const wrap = parseSacct("10897310|check|COMPLETED|0:0|00:00:03|/home/u|sbatch --wrap=\"env | grep X\nnvidia-smi\"\n")
     expect(wrap?.submitLine).toBe('sbatch --wrap="env | grep X\nnvidia-smi"')
     expect(parseSacct('3|j|CANCELLED by 1000|0:15|00:01:00|/w|sbatch a.sh')?.state).toBe('CANCELLED')
@@ -479,6 +479,23 @@ test('a job this session launched with sbatch: its end reaches this Claude', asy
   expect(r.submitted[0]).toContain('t4-train (2001) completed')
   expect(r.sent).toEqual([])
   expect(r.toasts.some(t => t.includes('completed'))).toBe(true)
+})
+
+test('a job that starts and ends between two polls: its launcher still gets the alert', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // squeue never lists it: it was submitted and done before the next poll.
+  const c: Cluster = { squeue: SQUEUE.split('\n')[0]!, sacct: { '2001': COMPLETED_2001 }, ran: [], files: {} }
+  cluster(on, c)
+  const submitted: string[] = []
+  const sent: { to: unknown; text: string }[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }], sent, bash: 'Submitted batch job 2001\n' })
+  await clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'sbatch slurm/train.sbatch', agentId: 'r1' } as never)
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(sent).toHaveLength(1)
+  expect(sent[0]!.text).toContain('t4-train (2001) completed')
+  expect(submitted).toEqual([])
 })
 
 test('a launcher script that prints what it submitted: its jobs are this session\'s', async ($, on) => {

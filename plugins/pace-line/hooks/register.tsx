@@ -456,6 +456,7 @@ async function poll($: EngineInterface): Promise<void> {
         exitCode: acct.exitCode,
         elapsedS: acct.elapsedS ?? j.elapsedS,
         submitLine: acct.submitLine,
+        name: j.name || acct.name,
         workDir: j.workDir ?? acct.workDir,
         endedAt: t,
       })
@@ -557,6 +558,13 @@ async function recordSbatch($: EngineInterface, command: string, stdout: string,
     const was = await ownerOf($, id)
     if (was && was.via !== 'guess') continue
     await setOwner($, id, { sessionId: me, ...(agentId ? { agentId } : {}), at: t, via: 'sbatch' })
+  }
+  // Watched from now, not from the next squeue: a job that starts and ends
+  // between two polls is then still found ended (by sacct) and its alert sent.
+  // Not an array: its tasks show up in squeue under their own ids.
+  const fresh = ids.filter(id => !before.has(id))
+  if (fresh.length && !/(?:^|\s)(?:--array\b|-a\s)/.test(command)) {
+    await update($, jobsAtom, s => ({ ...s, jobs: [...s.jobs, ...fresh.filter(id => !s.jobs.some(j => baseId(j.id) === id)).map(id => ({ ...newJob(id), submittedAt: t }))] }))
   }
   if (ids.length || !runsSbatch(command)) return
   // An sbatch that printed no id (quiet, or output sent elsewhere): the job that shows up next is taken to be this caller's.

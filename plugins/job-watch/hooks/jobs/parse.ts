@@ -93,6 +93,7 @@ export const SACCT_FIELDS = 'JobID,JobName,State,ExitCode,Elapsed,WorkDir,Submit
 
 export type Accounting = {
   jobId: string
+  name: string
   state: string
   exitCode: string
   elapsedS: number | null
@@ -110,10 +111,11 @@ export function parseSacct(out: string): Accounting | null {
   if (!text.trim()) return null
   const parts = text.split('|')
   if (parts.length < 7) return null
-  const [jobId = '', , state = '', exitCode = '', elapsed = '', workDir = ''] = parts
+  const [jobId = '', name = '', state = '', exitCode = '', elapsed = '', workDir = ''] = parts
   const submitLine = parts.slice(6).join('|').trim()
   return {
     jobId,
+    name,
     state: state.split(' ')[0] ?? state,
     exitCode,
     elapsedS: slurmDuration(elapsed),
