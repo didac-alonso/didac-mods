@@ -323,7 +323,7 @@ const startSession = async ($: Engine, on: On, submitted: string[], o: SessionOp
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: o.bash ?? '', stderr: '', interrupted: false } }))
   on('agent.spawn', (_$, e) => ({ model: 'claude-sonnet-5-5', agentId: (e as { resume?: { agentId?: string } }).resume?.agentId ?? 'new' }) as never)
   on('prompt.submit', (_$, e) => {
-    submitted.push(e.text)
+    submitted.push([e.text, ...((e as { context?: string[] }).context ?? [])].join('\n'))
     return { text: e.text }
   })
   on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: '' }))
@@ -675,7 +675,10 @@ test('a job-runner\'s [waiting] hand-back is dropped; its report, and other agen
   const clock = mock.clock(on, { now: NOW })
   cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
   const submitted: string[] = []
-  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }, { id: 'g1', status: 'completed', type: 'general-purpose' }] })
+  await startSession($, on, submitted, {
+    agents: [{ id: 'r1', status: 'completed' }, { id: 'r2', status: 'completed' }, { id: 'g1', status: 'completed', type: 'general-purpose' }],
+    store: { 'owner:3001': { sessionId: 'S1', agentId: 'r1', at: NOW, via: 'sbatch' } },
+  })
   await clock.settle()
   const peer = (text: string) => $.prompt.submit({ text, origin: { kind: 'peer' } } as never)
 
@@ -686,6 +689,11 @@ test('a job-runner\'s [waiting] hand-back is dropped; its report, and other agen
   await peer(handBack('r1', 'Sweep done.\n| lr | Acc |\n| 3e-4 | 87.3 |'))
   await peer(handBack('g1', '[waiting] something else'))
   expect(submitted).toHaveLength(2)
+
+  // A runner waiting on a job pace-line never saw it launch: nothing would resume it, so it is shown, with a warning.
+  await peer(handBack('r2', '[waiting] 3005 pending; next: check it'))
+  expect(submitted).toHaveLength(3)
+  expect(submitted[2]).toContain('no alert will resume it')
 })
 
 test('`: jobs own` from a subagent makes the job that subagent\'s', async ($, on) => {

@@ -100,6 +100,9 @@ export const RUNNER_TYPE = 'pace-line:job-runner'
 
 export const WAIT_NOTHING = 'pace-line: you own no running or pending job, so nothing would resume you. Don\'t wait: finish your brief, or hand back a report of what happened (if you launched jobs, say how: their ids were not seen, so they are not yours).'
 
+/** Context for the main session when a subagent says it is waiting but owns no job still to end. */
+export const NOTHING_TO_WAKE = '[pace-line: this subagent says it is waiting on its jobs, but pace-line sees no running or pending job of its own (its sbatch output was not seen, or the jobs already ended), so no alert will resume it. Check its jobs with squeue/sacct and either resume it with SendMessage or take them over with `: jobs own <id…>`.]'
+
 export const WAIT_TEXT = 'Noted: until a message resumes you, what you hand back is kept from the main session, and each alert for your jobs resumes you. End your turn now: hand back one `[waiting]` line saying what is running and what you will do next.'
 
 /**

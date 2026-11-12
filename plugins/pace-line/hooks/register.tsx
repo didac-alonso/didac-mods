@@ -12,7 +12,7 @@ import { SACCT_FIELDS, SQUEUE_FORMAT, parseDf, parseJobDetail, parseLogTail, par
 import { CONVENTIONS, EMPTY_JOBS, TEMPLATES, configFrom } from './jobs/state'
 import type { WatchConfig } from './jobs/state'
 import { jobsLine, jobsTab } from './jobs/view'
-import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, WAIT_NOTHING, WAIT_TEXT, handBackFrom, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
+import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, NOTHING_TO_WAKE, WAIT_NOTHING, WAIT_TEXT, handBackFrom, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
 import type { JobsOp, Owner, Whose } from './jobs/owners'
 
 const EMPTY: Snapshot = {
@@ -1031,20 +1031,28 @@ export const register: Register = (on, options) => {
     // A waiting subagent's task-notification (it stopped, with or without a hand-back).
     if (e.origin?.kind === 'task-notification') {
       const task = /<task-id>([^<]+)<\/task-id>/.exec(e.text)?.[1]
-      if (task && waiting.has(task)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
+      if (task && waiting.has(task)) {
+        if (await ownsLiveJob($, task)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
+        waiting.delete(task)
+        return next({ ...e, context: [...(e.context ?? []), NOTHING_TO_WAKE] })
+      }
       return next(e)
     }
     if (e.origin?.kind === 'peer') {
       // Said with `: jobs wait` (the runner's own call, kept whatever its
       // hand-back then says), or a job-runner's report with a `[waiting]` line.
+      // Only while it owns a job still to end: else no alert would resume it, so
+      // the main session sees the hand-back, told nothing will wake that subagent.
       const from = handBackFrom(e.text)
-      if (from && waiting.has(from)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
-      const agentId = waitingFrom(e.text)
-      if (agentId) {
+      const agentId = from && waiting.has(from) ? from : waitingFrom(e.text)
+      if (!agentId) return next(e)
+      if (agentId !== from || !waiting.has(agentId)) {
         const agents = (await $.agent.list()) as { id: string; type: string }[]
-        if (agents.find(a => a.id === agentId)?.type === RUNNER_TYPE) return { drop: 'pace-line: the job-runner is waiting on its jobs' }
+        if (agents.find(a => a.id === agentId)?.type !== RUNNER_TYPE) return next(e)
       }
-      return next(e)
+      if (await ownsLiveJob($, agentId)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
+      waiting.delete(agentId)
+      return next({ ...e, context: [...(e.context ?? []), NOTHING_TO_WAKE] })
     }
     if (toldOwners || !isWatching || e.origin?.kind !== 'composer') return next(e)
     toldOwners = true
