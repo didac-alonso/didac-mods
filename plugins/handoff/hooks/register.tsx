@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, SessionMessage } from 'claude-code'
+import type { EngineInterface, Register, RenderChildren, ResolveInput, SessionMessage } from 'claude-code'
 
 import type { Panel, Step } from '../types'
 
@@ -35,6 +35,8 @@ let sid = ''
 let home = ''
 let petDir = ''
 let busy = false
+// Darwin or not: pbcopy, open and the claude:// link exist only on a Mac.
+let isMac = true
 // The model asked for a refresh in the middle of its turn: it starts when the turn ends,
 // because a fork while a tool call is open would send a tool use with no result.
 let pending = false
@@ -189,7 +191,7 @@ async function step<T>($: EngineInterface, i: number, work: () => Promise<T>, de
 
 type Gathered = { messages: SessionMessage[]; tools: number; files: string[]; skills: string[]; links: string[] }
 
-const PATH_RE = /(?:~|\/Users)\/[^\s'"`<>()|;,*]+/g
+const PATH_RE = /(?:~|\/Users|\/home|\/projects)\/[^\s'"`<>()|;,*]+/g
 const URL_RE = /https?:\/\/[^\s'"`<>()\]]+/g
 
 async function gatherFiles($: EngineInterface, messages: SessionMessage[]) {
@@ -404,6 +406,8 @@ async function run($: EngineInterface) {
   ticker = $.clock.every(TICK_MS, () => {
     void tick($).catch(() => undefined)
   })
+  const shownAt = await $.clock.now()
+  void showIfCovered($, shownAt).catch(() => undefined)
   try {
     const cwd = await $.session.cwd()
     const messages = await step(
@@ -502,10 +506,82 @@ async function note($: EngineInterface, text: string) {
   if (p) await setPanel($, { ...p, note: text })
 }
 
+// The terminal's own copy first: over ssh it writes OSC 52, so the text lands on the
+// clipboard of the computer you type on. Then the clipboard tools this machine has.
+async function copyText($: EngineInterface, text: string) {
+  try {
+    const r = await $.ui.copy({ text })
+    if (r.isCopied) return true
+  } catch {
+    // Refused or no surface: try the tools.
+  }
+  const tools = isMac ? [['pbcopy']] : [['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']]
+  for (const cmd of tools) {
+    const r = await $.process.run(cmd, { stdin: text }).catch(() => null)
+    if (r && r.exitCode === 0) return true
+  }
+  return false
+}
+
 async function copy($: EngineInterface) {
   if (!handoffText) return
-  const r = await $.process.run(['pbcopy'], { stdin: handoffText })
-  await note($, r.exitCode === 0 ? 'Copied. Paste it into a new chat with ⌘V.' : 'Copy failed. Use Open file instead.')
+  const ok = await copyText($, handoffText)
+  await note($, ok ? `Copied. Paste it into a new chat with ${isMac ? '⌘V' : 'your paste key'}.` : 'Copy failed. Use Open file instead.')
+}
+
+// Open file: the Mac's own app; on Linux with a display, xdg-open; over ssh, the text
+// in this mod's pane (focused, so the arrow keys scroll it).
+async function openFile($: EngineInterface) {
+  if (!handoffPath) return
+  if (isMac) {
+    await $.process.run(['open', handoffPath])
+    return
+  }
+  const gui = await $.process
+    .run(['sh', '-c', '[ -n "$DISPLAY$WAYLAND_DISPLAY" ] && command -v xdg-open >/dev/null && xdg-open "$1" >/dev/null 2>&1 &', 'sh', handoffPath])
+    .catch(() => null)
+  if (gui && gui.exitCode === 0 && (await hasDisplay($))) return
+  paneMode = 'text'
+  await showPane($, true)
+}
+
+async function hasDisplay($: EngineInterface) {
+  const r = await $.process.run(['sh', '-c', '[ -n "$DISPLAY$WAYLAND_DISPLAY" ]']).catch(() => null)
+  return !!r && r.exitCode === 0
+}
+
+// The band above the prompt is drawn by every mod's hook in turn, and one above this
+// (agent-crew's, say) may draw its own and never pass the band on. When this mod's band
+// hook has not run since the panel changed, the same panel goes in a pane instead.
+const PANE_ID = 'handoff'
+let bandReachedAt = 0
+let paneOpen = false
+let paneMode: 'panel' | 'text' = 'panel'
+
+async function showPane($: EngineInterface, focus = false) {
+  paneOpen = true
+  const r = await $.ui.open({ id: PANE_ID, title: paneMode === 'text' ? 'Handoff' : 'Refresh', ...(focus ? { focus: true as const } : {}) }).catch(() => null)
+  try {
+    $.ui.invalidate('ui.render')
+  } catch {
+    // The pane's first drawing follows the open anyway.
+  }
+  if (r && !r.isPlaced) await log($, `pane waits: ${r.reason}`)
+}
+
+async function hidePane($: EngineInterface) {
+  paneMode = 'panel'
+  if (!paneOpen) return
+  paneOpen = false
+  await $.ui.close({ id: PANE_ID }).catch(() => undefined)
+}
+
+// Waits a moment for the band to draw what changed; if it did not, opens the pane.
+async function showIfCovered($: EngineInterface, since: number) {
+  await $.clock.sleep(900)
+  if (bandReachedAt >= since || paneOpen) return
+  await log($, 'band covered by another mod, panel shown in a pane')
+  await showPane($)
 }
 
 async function petAlive($: EngineInterface) {
@@ -543,7 +619,7 @@ async function startNew($: EngineInterface) {
     return
   }
   const url = `claude://code/new?q=${encodeURIComponent(handoffText)}`
-  const r = await $.process.run(['open', url])
+  const r = await $.process.run([isMac ? 'open' : 'xdg-open', url]).catch(() => ({ exitCode: 1 }))
   await note($, r.exitCode === 0 ? 'A new chat is filled in with the handoff. Press Return there to start it.' : 'The new chat did not open. Use Copy handoff prompt instead.')
 }
 
@@ -552,7 +628,8 @@ async function startNew($: EngineInterface) {
 async function clearAndFill($: EngineInterface) {
   if (!handoffText || busy) return
   const text = handoffText
-  await $.process.run(['pbcopy'], { stdin: text }).catch(() => undefined)
+  await copyText($, text).catch(() => false)
+  await hidePane($)
   await note($, 'Clearing the chat…')
   try {
     // Runs once the session is idle; resolves after the clear.
@@ -630,6 +707,7 @@ async function close($: EngineInterface) {
     if (sid) await $.store.set(`snooze:${sid}`, snoozedTo)
   }
   await setPanel($, null)
+  await hidePane($)
 }
 
 function bar(progress: number, status: Step['status']) {
@@ -641,6 +719,8 @@ function bar(progress: number, status: Step['status']) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     sid = await $.session.id()
+    isMac = (await $.process.run(['uname']).catch(() => ({ stdout: 'Darwin' }))).stdout.trim() === 'Darwin'
+    paneOpen = (await $.ui.panes().catch(() => [])).some(p => p.id === PANE_ID)
     home = $.plugin.root.split('/.claude/')[0] ?? ''
     petDir = `${home}/.claude/pet`
     await poll($).catch(() => undefined)
@@ -701,8 +781,10 @@ export const register: Register = on => {
 
   on('command.run', { command: 'handoff' }, async $ => {
     if (off) return { text: 'Handoff (Refresh) is off. Turn it on with /mods.' }
+    const since = await $.clock.now()
     void run($).catch(() => undefined)
-    return { text: 'Writing the handoff. Watch the panel above the prompt.' }
+    await showIfCovered($, since).catch(() => undefined)
+    return { text: paneOpen ? 'Writing the handoff. Another mod covers the band, so the steps are in the Refresh pane.' : 'Writing the handoff. Watch the panel above the prompt.' }
   })
 
   // One unfiltered hook: a typed tool matcher makes tsc recurse through the connector types.
@@ -738,7 +820,7 @@ export const register: Register = on => {
     return { element: e.element }
   })
   on('ui.press', { plugin: 'handoff', element: 'open' }, async ($, e) => {
-    if (handoffPath) await $.process.run(['open', handoffPath])
+    await openFile($)
     return { element: e.element }
   })
   on('ui.press', { plugin: 'handoff', element: 'close' }, async ($, e) => {
@@ -747,112 +829,148 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // Reaching this hook means no mod above kept the band to itself.
+    bandReachedAt = await $.clock.now()
     if (off) return next(e)
     const p = await getPanel($)
     if (!p || e.props.hasSurvey) return next(e)
+    // The panel is in the pane already: once is enough.
+    if (paneOpen) return next(e)
     // The offer waits out a running turn; the steps and the result do not.
     if (p.phase === 'offer' && e.props.isWorking) return next(e)
     const rest = await next(e)
+    return panelTree($, e, p, rest)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const noop = () => undefined
-
-    if (p.phase === 'offer') {
+    if (paneMode === 'text') {
       return (
         <Box flexDirection="column">
-          {rest}
-          <Box flexDirection="row" alignItems="center" justifyContent="space-between" gap={1}>
-            <Text>
-              <Text color={ACCENT}>●</Text>
-              <Text dimColor> Context at {short(p.tokens)}. Refresh moves this work to a new chat with a full handoff.</Text>
-            </Text>
-            <Box flexDirection="row" gap={1}>
-              <Button key="refresh" label="Refresh" variant="primary" onPress={noop} />
-              <Button key="close" label="Hide" role="dismiss" onPress={noop} />
-            </Box>
+          <Text dimColor wrap="truncate-middle">
+            {tilde(handoffPath)} · arrow keys scroll
+          </Text>
+          <Text>{handoffText || 'No handoff yet.'}</Text>
+          <Box flexDirection="row" gap={1}>
+            <Button key="copy" label="Copy" variant="primary" onPress={noop} />
+            <Button key="hidepane" label="Close" role="dismiss" onPress={noop} />
           </Box>
         </Box>
       )
     }
+    const p = await getPanel($)
+    if (!p) return <Text dimColor>No handoff running.</Text>
+    return panelTree($, e, p, null)
+  })
 
-    const title =
-      p.phase === 'working'
-        ? 'Refreshing: building your handoff'
-        : p.phase === 'ready'
-          ? `Handoff ready: ${p.words.toLocaleString('en-US')} words`
-          : 'The handoff did not finish'
-    const rows = p.steps.map((s, i) => {
-      const icon =
-        s.status === 'done' ? (
-          <Text color={GOOD}>✓</Text>
-        ) : s.status === 'fail' ? (
-          <Text color={BAD}>✗</Text>
-        ) : s.status === 'run' ? (
-          <Text color={ACCENT}>{SPIN[p.tick % SPIN.length]}</Text>
-        ) : (
-          <Text dimColor>○</Text>
-        )
-      const b = bar(s.progress, s.status)
-      return (
-        <Box key={`row${i}`} flexDirection="row" gap={1}>
-          <Box width={2}>{icon}</Box>
-          <Box width={32}>
-            <Text dimColor={s.status === 'wait'} wrap="truncate-end">
-              {i + 1}. {s.label}
-            </Text>
-          </Box>
-          <Text>
-            <Text color={b.color}>{b.on}</Text>
-            <Text dimColor>{b.off}</Text>
-          </Text>
-          <Text dimColor wrap="truncate-end">
-            {s.detail}
-          </Text>
-        </Box>
-      )
-    })
+  on('ui.press', { plugin: 'handoff', element: 'hidepane' }, async ($, e) => {
+    await hidePane($)
+    return { element: e.element }
+  })
+}
 
+// The panel itself, for the band above the prompt and for the pane alike.
+function panelTree($: EngineInterface, e: ResolveInput, p: Panel, rest: RenderChildren) {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const noop = () => undefined
+
+  if (p.phase === 'offer') {
     return (
       <Box flexDirection="column">
         {rest}
-        <Box flexDirection="column" gap={0} paddingY={0}>
-          <Text bold color={p.phase === 'failed' ? BAD : p.phase === 'ready' ? GOOD : ACCENT}>
-            {title}
+        <Box flexDirection="row" alignItems="center" justifyContent="space-between" gap={1}>
+          <Text>
+            <Text color={ACCENT}>●</Text>
+            <Text dimColor> Context at {short(p.tokens)}. Refresh moves this work to a new chat with a full handoff.</Text>
           </Text>
-          {rows}
-          {p.phase === 'ready' ? (
-            <Box flexDirection="column">
-              <Text dimColor wrap="truncate-middle">
-                Saved to {p.file}
-              </Text>
-              <Box flexDirection="row" gap={1}>
-                <Button key="clear" label="Clear and paste here" variant="primary" onPress={noop} />
-                <Button key="copy" label="Copy handoff prompt" variant="secondary" onPress={noop} />
-                <Button key="start" label="New chat with it" onPress={noop} />
-                <Button key="open" label="Open file" onPress={noop} />
-                <Button key="close" label="Close" role="dismiss" onPress={noop} />
-              </Box>
-            </Box>
-          ) : null}
-          {p.phase === 'failed' ? (
-            <Box flexDirection="column">
-              <Text color={BAD}>{p.error}</Text>
-              {p.file ? (
-                <Text dimColor wrap="truncate-middle">
-                  Draft saved to {p.file}
-                </Text>
-              ) : null}
-              <Box flexDirection="row" gap={1}>
-                <Button key="retry" label="Try again" variant="primary" onPress={noop} />
-                {p.file ? <Button key="clear" label="Clear and paste draft" onPress={noop} /> : null}
-                {p.file ? <Button key="copy" label="Copy draft" onPress={noop} /> : null}
-                {p.file ? <Button key="open" label="Open draft" onPress={noop} /> : null}
-                <Button key="close" label="Close" role="dismiss" onPress={noop} />
-              </Box>
-            </Box>
-          ) : null}
-          {p.note ? <Text dimColor>{p.note}</Text> : null}
+          <Box flexDirection="row" gap={1}>
+            <Button key="refresh" label="Refresh" variant="primary" onPress={noop} />
+            <Button key="close" label="Hide" role="dismiss" onPress={noop} />
+          </Box>
         </Box>
       </Box>
     )
+  }
+
+  const title =
+    p.phase === 'working'
+      ? 'Refreshing: building your handoff'
+      : p.phase === 'ready'
+        ? `Handoff ready: ${p.words.toLocaleString('en-US')} words`
+        : 'The handoff did not finish'
+  const rows = p.steps.map((s, i) => {
+    const icon =
+      s.status === 'done' ? (
+        <Text color={GOOD}>✓</Text>
+      ) : s.status === 'fail' ? (
+        <Text color={BAD}>✗</Text>
+      ) : s.status === 'run' ? (
+        <Text color={ACCENT}>{SPIN[p.tick % SPIN.length]}</Text>
+      ) : (
+        <Text dimColor>○</Text>
+      )
+    const b = bar(s.progress, s.status)
+    return (
+      <Box key={`row${i}`} flexDirection="row" gap={1}>
+        <Box width={2}>{icon}</Box>
+        <Box width={32}>
+          <Text dimColor={s.status === 'wait'} wrap="truncate-end">
+            {i + 1}. {s.label}
+          </Text>
+        </Box>
+        <Text>
+          <Text color={b.color}>{b.on}</Text>
+          <Text dimColor>{b.off}</Text>
+        </Text>
+        <Text dimColor wrap="truncate-end">
+          {s.detail}
+        </Text>
+      </Box>
+    )
   })
+
+  return (
+    <Box flexDirection="column">
+      {rest}
+      <Box flexDirection="column" gap={0} paddingY={0}>
+        <Text bold color={p.phase === 'failed' ? BAD : p.phase === 'ready' ? GOOD : ACCENT}>
+          {title}
+        </Text>
+        {rows}
+        {p.phase === 'ready' ? (
+          <Box flexDirection="column">
+            <Text dimColor wrap="truncate-middle">
+              Saved to {p.file}
+            </Text>
+            <Box flexDirection="row" gap={1}>
+              <Button key="clear" label="Clear and paste here" variant="primary" onPress={noop} />
+              <Button key="copy" label="Copy handoff prompt" variant="secondary" onPress={noop} />
+              {isMac ? <Button key="start" label="New chat with it" onPress={noop} /> : null}
+              <Button key="open" label="Open file" onPress={noop} />
+              <Button key="close" label="Close" role="dismiss" onPress={noop} />
+            </Box>
+          </Box>
+        ) : null}
+        {p.phase === 'failed' ? (
+          <Box flexDirection="column">
+            <Text color={BAD}>{p.error}</Text>
+            {p.file ? (
+              <Text dimColor wrap="truncate-middle">
+                Draft saved to {p.file}
+              </Text>
+            ) : null}
+            <Box flexDirection="row" gap={1}>
+              <Button key="retry" label="Try again" variant="primary" onPress={noop} />
+              {p.file ? <Button key="clear" label="Clear and paste draft" onPress={noop} /> : null}
+              {p.file ? <Button key="copy" label="Copy draft" onPress={noop} /> : null}
+              {p.file ? <Button key="open" label="Open draft" onPress={noop} /> : null}
+              <Button key="close" label="Close" role="dismiss" onPress={noop} />
+            </Box>
+          </Box>
+        ) : null}
+        {p.note ? <Text dimColor>{p.note}</Text> : null}
+      </Box>
+    </Box>
+  )
 }
