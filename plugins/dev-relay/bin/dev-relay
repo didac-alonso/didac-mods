@@ -62,6 +62,10 @@ DEFAULTS = {
 BUSY = ("working", "blocked")
 # COMPLETING is a job already being killed: never the live one, never one to take over
 LIVE = ("RUNNING",)
+# a job on its way out neither serves nor stops a new one (cancelled, it can sit in COMPLETING for minutes)
+ENDING = ("COMPLETING", "COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL", "PREEMPTED",
+          "BOOT_FAIL", "DEADLINE", "OUT_OF_MEMORY")
+COMING = ("PENDING", "CONFIGURING")
 # Variables a successor or a herdr server must not inherit: another Claude's
 # (CLAUDE_CODE_CHILD_SESSION turns transcripts off), the herdr pane or session
 # it was started from, or the submitting job's Slurm allocation. herdr's own
@@ -987,14 +991,15 @@ def current(wait: float) -> str | None:
         elif live:
             if t - start >= min(wait, 90):
                 return live[0]["job"]
-        elif t - start >= wait or not any(j["state"] == "PENDING" for j in jobs):
+        elif t - start >= wait or not any(j["state"] in COMING for j in jobs):
             return None
         sleep(3)
 
 
 @contextmanager
-def dir_lock(path: Path, stale: float = 120):
-    """mkdir is atomic on NFS, where $HOME lives (v3, no local locks: lockf can hang)."""
+def dir_lock(path: Path, stale: float = 600):
+    """mkdir is atomic on NFS, where $HOME lives (v3, no local locks: lockf can hang). `stale` is
+    longer than a holder can take (squeue 120 s, sbatch 300 s), or a second client gets in mid-sbatch."""
     path.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(900):
         try:
@@ -1021,8 +1026,10 @@ def ensure(wait: float) -> str | None:
     # several clients connecting at once (VS Code opens a few) submit one job between them
     with dir_lock(state_dir() / "ensure.lock.d"):
         jid = current(0)
-        # only a squeue that answered "none" submits one: a failing one would double the dev-shell
-        if not jid and dev_jobs() == []:
+        jobs = dev_jobs()
+        # only a squeue that answered submits one (a failing one would double the dev-shell),
+        # and only when every job it names is on its way out
+        if not jid and jobs is not None and all(j["state"] in ENDING for j in jobs):
             jid = submit(None)
             if not jid:
                 return None

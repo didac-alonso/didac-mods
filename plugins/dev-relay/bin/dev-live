@@ -38,9 +38,14 @@ for k in JOB_NAME SBATCH SBATCH_ARGS SSHD_PORT STATE_DIR; do
   [[ -n ${!o+x} ]] && printf -v "$k" %s "${!o}"
 done
 POLL=${DEV_LIVE_POLL:-3}     # seconds between looks
-STALE=${DEV_LIVE_STALE:-120} # seconds after which ensure.lock.d was left by a client that died
+# seconds after which ensure.lock.d was left by a client that died. Longer than a holder can
+# take (squeue 120 s, sbatch 300 s): a shorter one let a second client in mid-sbatch, two dev-shells.
+STALE=${DEV_LIVE_STALE:-600}
 RETRY=${DEV_LIVE_RETRY:-30}  # seconds a failing squeue is retried, at least
+SSHD_WAIT=${DEV_LIVE_SSHD_WAIT:-120} # seconds `dev-live sshd` waits for a queued dev-shell
 LOCK=$STATE_DIR/ensure.lock.d
+# a job on its way out: it neither serves nor stops a new one (cancelled, it can sit in COMPLETING for minutes)
+ENDING='^(COMPLETING|COMPLETED|CANCELLED|FAILED|TIMEOUT|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE|OUT_OF_MEMORY)$'
 
 JOBS= LIVE_JOB= TARGET=
 
@@ -88,7 +93,7 @@ current() {
         LIVE_JOB=$(head -n1 <<<"$live")
         return 0
       fi
-    elif ((t >= wait)) || ! grep -q '^[^|]*|PENDING|' <<<"$JOBS"; then
+    elif ((t >= wait)) || ! grep -qE '^[^|]*\|(PENDING|CONFIGURING)\|' <<<"$JOBS"; then
       return 3
     fi
     sleep "$POLL"
@@ -138,7 +143,8 @@ submit() {
   echo "$v"
 }
 
-# several clients connecting at once (VS Code opens a few) submit one job between them
+# several clients connecting at once (VS Code opens a few) submit one job between them;
+# $1: seconds to wait for it (1800)
 ensure() {
   local rc jid
   take_lock
@@ -148,7 +154,7 @@ ensure() {
     drop_lock
     return 4
   fi
-  if ((rc == 3)) && jobs && [[ -z $JOBS ]]; then
+  if ((rc == 3)) && jobs && ! awk -F'|' -v e="$ENDING" '$1 != "" && $2 !~ e {f = 1} END {exit !f}' <<<"$JOBS"; then
     if ! jid=$(submit); then
       drop_lock
       return 3
@@ -156,7 +162,7 @@ ensure() {
     echo "submitted $jid, waiting for a node..." >&2
   fi
   drop_lock
-  current 1800
+  current "${1:-1800}"
 }
 
 sshd_up() { timeout 3 bash -c "exec 3<>/dev/tcp/$1/$SSHD_PORT" 2>/dev/null; }
@@ -181,7 +187,8 @@ sshd_target() {
       return 5
     fi
   fi
-  ensure || return
+  # bounded: the apps retry, and a lookup left waiting half an hour holds its SSH session that long
+  ensure "$SSHD_WAIT" || return
   node=$(job_node "$LIVE_JOB")
   [[ -n $node ]] || node=$(timeout 120 squeue -h -j "$LIVE_JOB" -o %N 2>/dev/null)
   # a job that has just started opens the port within seconds
