@@ -752,6 +752,8 @@ async function deliver($: EngineInterface, d: Delivery): Promise<void> {
 /** Whether a subagent owns a job not ended: running or pending, or submitted in the last 10 min and not polled yet. */
 async function ownsLiveJob($: EngineInterface, agentId: string): Promise<boolean> {
   const t = await $.clock.now()
+  // What it tee'd since the last poll counts: a runner hands back `[waiting]` right after its sbatch.
+  await readClaims($, t).catch(() => {})
   const jobs = (await read($, jobsAtom)).jobs
   for (const key of await $.store.keys()) {
     if (!key.startsWith(OWNER)) continue

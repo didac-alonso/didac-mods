@@ -770,6 +770,22 @@ test('a runner woken by an alert is told to tee its sbatch to its claim file, an
   expect(submitted).toEqual([])
 })
 
+test('a [waiting] hand-back right after a tee\'d sbatch is kept back: the claim file is read first', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const c: Cluster = { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} }
+  cluster(on, c)
+  const submitted: string[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed', type: 'pace-line:job-runner' }], store: { 'owner:2001': { sessionId: 'S1', agentId: 'r1', at: NOW - 3_600_000, via: 'sbatch' } } })
+  await clock.settle()
+  // Resumed by an alert, it tee'd a new sbatch and handed back at once, before any poll.
+  c.files['/home/demo/.cache/pace-line/claims/r1'] = 'Submitted batch job 2002\n'
+  const r = await $.prompt.submit({ text: handBack('r1', '[waiting] 2002 pending; next: report'), origin: { kind: 'peer' } } as never)
+  expect((r as { drop?: string }).drop).toContain('waiting on its jobs')
+  const stop = await $.prompt.submit({ text: '<task-notification>\n<task-id>r1</task-id>\n<status>completed</status>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
+  expect((stop as { drop?: string }).drop).toContain('waiting on its jobs')
+  expect(submitted).toEqual([])
+})
+
 test('`: jobs wait` from a runner hides its next hand-back, whatever it says; from the main loop it only explains', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
