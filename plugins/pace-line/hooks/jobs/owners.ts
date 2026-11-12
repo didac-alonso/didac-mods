@@ -93,3 +93,15 @@ export function mainText(alerts: string, logs: string[], inherited: string[]): s
     'For a failure, read the end of its log and propose a fix. Do not resubmit unless the user asks: pace-line already resubmits TIMEOUTs from their latest checkpoint. For an idle GPU, a silent log or a long pending job, check it and say what you would do. For a resubmission, update the project EXPERIMENTS.md row if there is one. Keep it short.',
   ].filter(Boolean).join('\n')
 }
+
+export const RUNNER_TYPE = 'pace-line:job-runner'
+
+/**
+ * A subagent's hand-back that only says it is waiting on its jobs: the agent
+ * id it is from, else null. The harness frames it as `<agent-message from="…">`
+ * with the report indented; `[waiting]` starts a line of it.
+ */
+export function waitingFrom(text: string): string | null {
+  const m = /^<agent-message from="([^"]+)">/.exec(text.trimStart())
+  return m && /^\s*\[waiting\]/m.test(text) ? m[1]! : null
+}

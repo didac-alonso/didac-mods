@@ -12,7 +12,7 @@ import { SACCT_FIELDS, SQUEUE_FORMAT, parseDf, parseJobDetail, parseLogTail, par
 import { CONVENTIONS, EMPTY_JOBS, TEMPLATES, configFrom } from './jobs/state'
 import type { WatchConfig } from './jobs/state'
 import { jobsLine, jobsTab } from './jobs/view'
-import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, runnerText, runsSbatch, submittedIds, whose } from './jobs/owners'
+import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
 import type { JobsOp, Owner, Whose } from './jobs/owners'
 
 const EMPTY: Snapshot = {
@@ -999,8 +999,19 @@ export const register: Register = (on, options) => {
 
   // Once a session, and again after a compaction: how to take a job, so
   // "take job N" just works, and how many watched jobs nobody owns.
+  // And a job-runner that answered `[waiting]`: it launched its jobs and has
+  // nothing to say until their alerts resume it, so its hand-back would only
+  // wake the main session for nothing. Its final report, or a problem, still comes through.
   let toldOwners = false
   on('prompt.submit', async ($, e, next) => {
+    if (e.origin?.kind === 'peer') {
+      const agentId = waitingFrom(e.text)
+      if (agentId) {
+        const agents = (await $.agent.list()) as { id: string; type: string }[]
+        if (agents.find(a => a.id === agentId)?.type === RUNNER_TYPE) return { drop: 'pace-line: the job-runner is waiting on its jobs' }
+      }
+      return next(e)
+    }
     if (toldOwners || !isWatching || e.origin?.kind !== 'composer') return next(e)
     toldOwners = true
     const nobody = new Set((await read($, jobsAtom)).jobs.filter(j => j.endedAt === null && j.owner === 'none').map(j => baseId(j.id)))

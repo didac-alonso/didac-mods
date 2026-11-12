@@ -8,7 +8,7 @@ import { braille, fmtNum, sparkline } from './jobs/chart'
 import { EMPTY_METRICS, addChunk, ckptNumbers, ema, etaSeconds, lossKey, newestCkpt, trend, utf8Length, valKeys } from './jobs/metrics'
 import { gpusFromTres, parseDf, parseJobDetail, parseLogTail, parseSacct, parseSqueue, resumeArgv, shellWords, slurmTime, submittedId, zoneMinutes } from './jobs/parse'
 import { items, jobsLine, progressText } from './jobs/view'
-import { baseId, jobsOp, runsSbatch, submittedIds, whose } from './jobs/owners'
+import { baseId, jobsOp, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
 
 const NOW = Date.parse('2026-10-07T18:00:00Z')
 
@@ -282,7 +282,7 @@ function cluster(on: On, c: Cluster) {
 
 type SessionOpts = {
   store?: Record<string, unknown>
-  agents?: { id: string; status: string }[]
+  agents?: { id: string; status: string; type?: string }[]
   sent?: { to: unknown; text: string }[]
   toasts?: string[]
   /** What a Bash call prints beneath pace-line (an sbatch, for the capture). */
@@ -315,7 +315,7 @@ const startSession = async ($: Engine, on: On, submitted: string[], o: SessionOp
   on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('settings.read', () => ({ value: {} }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
-  on('agent.list', () => ({ value: (o.agents ?? []).map(a => ({ ...a, type: 'pace-line:job-runner', description: 'runner' })) as never }))
+  on('agent.list', () => ({ value: (o.agents ?? []).map(a => ({ type: 'pace-line:job-runner', description: 'runner', ...a })) as never }))
   on('session.send', (_$, e) => {
     o.sent?.push({ to: e.to, text: e.text })
     return { isDelivered: true }
@@ -653,4 +653,45 @@ test('an unowned job\'s toast says how to take it, and the panel\'s Take button 
   await clock.settle()
   expect(submitted).toHaveLength(1)
   expect(toasts.some(t => t.includes('/jobs own'))).toBe(false)
+})
+
+// ── job-runner: a `[waiting]` hand-back doesn't wake the main session ─────
+
+const handBack = (agentId: string, report: string) =>
+  `<agent-message from="${agentId}">\n[Subagent hand-back] The text below is the final report of a subagent this session delegated to.\n${report.split('\n').map(l => `  ${l}`).join('\n')}\n</agent-message>`
+
+test('waitingFrom: a hand-back whose report has a [waiting] line', () => {
+  expect(waitingFrom(handBack('a1', 'Launched a1, a2.\n[waiting] 3001, 3002 running; next: tea-a3'))).toBe('a1')
+  expect(waitingFrom(handBack('a1', 'All done: table below. Not [waiting] anymore.'))).toBeNull()
+  expect(waitingFrom('[waiting] typed by someone')).toBeNull()
+})
+
+test('a job-runner\'s [waiting] hand-back is dropped; its report, and other agents\' [waiting], are not', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
+  const submitted: string[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }, { id: 'g1', status: 'completed', type: 'general-purpose' }] })
+  await clock.settle()
+  const peer = (text: string) => $.prompt.submit({ text, origin: { kind: 'peer' } } as never)
+
+  const waiting = await peer(handBack('r1', '[waiting] 3001 running; next: a2'))
+  expect((waiting as { drop?: string }).drop).toContain('waiting on its jobs')
+  expect(submitted).toEqual([])
+
+  await peer(handBack('r1', 'Sweep done.\n| lr | Acc |\n| 3e-4 | 87.3 |'))
+  await peer(handBack('g1', '[waiting] something else'))
+  expect(submitted).toHaveLength(2)
+})
+
+test('`: jobs own` from a subagent makes the job that subagent\'s', async ($, on) => {
+  const r = await endsOnce($, on, {
+    agents: [{ id: 'r1', status: 'completed' }],
+    before: async () => {
+      const out = await $.tool.call({ tool: 'Bash', command: ': jobs own 2001', agentId: 'r1' } as never)
+      expect(stdoutOf(out)).toContain('Owned by this subagent now: 2001')
+    },
+  })
+  expect(r.store.get('owner:2001')).toMatchObject({ sessionId: 'S1', agentId: 'r1', via: 'own' })
+  expect(r.sent).toHaveLength(1)
+  expect(r.submitted).toEqual([])
 })
