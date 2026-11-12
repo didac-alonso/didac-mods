@@ -490,6 +490,7 @@ test('a job nobody owns: a toast, and no Claude is woken', async ($, on) => {
   const r = await endsOnce($, on)
   expect(r.submitted).toEqual([])
   expect(r.toasts.some(t => t.includes('t4-train (2001) completed'))).toBe(true)
+  expect(r.toasts.some(t => t.includes('unowned: /jobs own 2001'))).toBe(true)
 })
 
 test('another live session\'s job: left to it, no toast and no Claude here', async ($, on) => {
@@ -621,4 +622,35 @@ test('`: jobs` mixed with other commands is refused, not run as a plain `:`', as
   const r = await endsOnce($, on)
   expect(stdoutOf(await r.bash(': jobs own 2001 && echo ok'))).toContain('on its own')
   expect(r.store.get('owner:2001')).toBeUndefined()
+})
+
+test('an unowned job\'s toast says how to take it, and the panel\'s Take button does', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const c: Cluster = { squeue: SQUEUE.split('\n').slice(0, 2).join('\n'), sacct: { '2001': COMPLETED_2001 }, ran: [], files: { '/w/runs/slurm-2001.out': LOG } }
+  cluster(on, c)
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const toasts: string[] = []
+  const submitted: string[] = []
+  const store = await startSession($, on, submitted, { toasts })
+  await clock.settle()
+
+  await $.command.run({ command: 'jobs', args: '' } as Parameters<typeof $.command.run>[0])
+  const ui = await $.ui.mount({
+    plugin: 'pace-line',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'slurm-job',
+    props: { title: 'Slurm', isFocused: true, bodyColumns: 110, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  })
+  expect(await ui.find({ type: 'Text', text: '  unowned' })).toBeDefined()
+  await ui.press({ key: 'own-all' })
+  expect(store.get('owner:2001')).toMatchObject({ sessionId: 'S1', via: 'own' })
+  expect(toasts.some(t => t.includes('Owned by this session now: 2001'))).toBe(true)
+
+  // Taken: its end reaches this Claude, and no "unowned" hint.
+  c.squeue = SQUEUE.split('\n')[0]!
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(submitted).toHaveLength(1)
+  expect(toasts.some(t => t.includes('/jobs own'))).toBe(false)
 })

@@ -607,8 +607,9 @@ async function route($: EngineInterface, fresh: Alert[], owners: Map<string, Own
   const of = (a: Alert) => info.get(baseId(a.job)) ?? { whose: 'none' as const }
   const shared = await unseen($, fresh)
   const mine = me ? await unseen($, fresh.filter(a => of(a).whose === 'mine'), SEEN + me) : []
-  const nobody = shared.filter(a => of(a).whose === 'none')
-  await deliver($, { discord: shared, local: [...mine, ...nobody.filter(a => !mine.includes(a))], claude: mine, info })
+  // A job nobody owns: its toast says how to make it this session's.
+  const nobody = shared.filter(a => of(a).whose === 'none' && !mine.includes(a)).map(a => ({ ...a, text: `${a.text}  · unowned: /jobs own ${baseId(a.job)}` }))
+  await deliver($, { discord: shared, local: [...mine, ...nobody], claude: mine, info })
 }
 
 type Delivery = { discord: Alert[]; local: Alert[]; claude: Alert[]; info?: Map<string, OwnerInfo> }
@@ -1143,6 +1144,14 @@ export const register: Register = (on, options) => {
               }
             },
             refresh: () => void poll($),
+            own: async ids => {
+              $.ui.toast(await answerJobsOp($, { verb: 'own', ids, unowned: false }, undefined), { timeoutMs: 10_000 })
+              await poll($)
+            },
+            release: async ids => {
+              $.ui.toast(await answerJobsOp($, { verb: 'release', ids }, undefined), { timeoutMs: 10_000 })
+              await poll($)
+            },
           })}
         </Box>
       )
