@@ -11,6 +11,10 @@ import { SWEEP_COLORS, braille, fmtNum, rangeOf, sparkline } from './chart'
 import type { Line, Run } from './chart'
 import { ema, etaSeconds, lossKey, lowerIsBetter, stepRate, trend, valKeys } from './metrics'
 
+/** Whose Claude gets a job's alerts: the list row tags the jobs that are not this session's. */
+const OWNER_TAG = { other: 'other session', none: 'unowned' } as const
+const OWNER_TEXT = { mine: 'alerts: this session', other: 'alerts: another session', none: 'alerts: nobody (`: jobs own` to take it)' } as const
+
 export type Item =
   | { kind: 'job'; key: string; job: BatchJob }
   | { kind: 'array'; key: string; arrayId: string; name: string; tasks: BatchJob[] }
@@ -113,7 +117,15 @@ export type JobsActions = {
   resume: (j: BatchJob) => void
   cancel: (j: BatchJob) => void
   refresh: () => void
+  /** Make these jobs (base ids) this session's: their alerts come here. */
+  own: (ids: string[]) => void
+  release: (ids: string[]) => void
 }
+
+const baseOf = (id: string) => id.split(/[_+]/)[0]!
+
+/** Base ids of running or pending jobs nobody owns. */
+export const unownedIds = (jobs: readonly BatchJob[]) => [...new Set(jobs.filter(j => j.endedAt === null && j.owner === 'none').map(j => baseOf(j.id)))]
 
 const gib = (b: number) => `${(b / 2 ** 30).toFixed(1)}G`
 
@@ -204,7 +216,7 @@ function jobDetail(kit: Kit, j: BatchJob, s: Jobs, now: number, cols: number, ac
         <Text color={g.color}>{`${g.glyph} ${j.state}${j.reason ? ` (${j.reason})` : ''}`}</Text>
       </Box>
       <Text color={COLORS.GRAY} wrap="truncate-end">
-        {[j.nodeList || null, gpuText(j), j.workDir, j.resumedFrom && `resumed from ${j.resumedFrom}`, j.resumedAs && `resubmitted as ${j.resumedAs}`].filter(Boolean).join(' · ')}
+        {[j.nodeList || null, gpuText(j), j.workDir, j.resumedFrom && `resumed from ${j.resumedFrom}`, j.resumedAs && `resubmitted as ${j.resumedAs}`, j.owner && OWNER_TEXT[j.owner]].filter(Boolean).join(' · ')}
       </Text>
       {j.limitS !== null && j.elapsedS !== null && (
         <Text>
@@ -266,6 +278,8 @@ function jobDetail(kit: Kit, j: BatchJob, s: Jobs, now: number, cols: number, ac
         {node && j.state === 'RUNNING' && <Button key="ssh" label={`Copy ssh ${node}`} onPress={() => act.copy(`ssh ${node}`)} />}
         {j.stdout && <Button key="log" label="Copy tail -f" onPress={() => act.copy(`tail -f ${j.stdout}`)} />}
         {j.endedAt !== null && j.state !== 'COMPLETED' && !j.resumedAs && <Button key="resume" label="Resume from checkpoint" onPress={() => act.resume(j)} />}
+        {j.endedAt === null && j.owner && j.owner !== 'mine' && <Button key="own" label={j.owner === 'other' ? 'Take from the other session' : 'Take: alerts here'} onPress={() => act.own([baseOf(j.id)])} />}
+        {j.endedAt === null && j.owner === 'mine' && <Button key="release" label="Release" onPress={() => act.release([baseOf(j.id)])} />}
         {j.endedAt === null && <Button key="cancel" label="Cancel job" onPress={() => act.cancel(j)} />}
       </Box>
     </Box>
@@ -287,6 +301,11 @@ function arrayDetail(kit: Kit, it: Extract<Item, { kind: 'array' }>, cols: numbe
         <Text color={COLORS.MAGENTA} bold>{it.name}</Text>
         <Text color={PLAIN}>{`  array ${it.arrayId} · ${it.tasks.length} tasks`}</Text>
       </Text>
+      {it.tasks.some(t => t.endedAt === null && t.owner && t.owner !== 'mine') && (
+        <Box flexDirection="row" marginTop={1}>
+          <Button key="own" label="Take the sweep: alerts here" onPress={() => act.own([it.arrayId])} />
+        </Box>
+      )}
       {lines.length > 0 && chart(kit, 'sweep', 'loss (ema) per task', lines, width, 8, '')}
       <Box flexDirection="column" marginTop={1}>
         {it.tasks.map((t, i) => {
@@ -347,6 +366,7 @@ export function jobsTab(kit: Kit, s: Jobs, now: number, cols: number, act: JobsA
               <Text color={COLORS.GRAY}>{gpuText(j) ? `  ${gpuText(j)}` : ''}</Text>
               <Text color={PLAIN}>{progressText(j) ? `  ${progressText(j)}` : ''}</Text>
               <Text color={COLORS.GRAY}>{j.state === 'PENDING' && j.reason ? `  ${j.reason}` : ''}</Text>
+              <Text color={COLORS.GRAY}>{j.owner && j.owner !== 'mine' ? `  ${OWNER_TAG[j.owner]}` : ''}</Text>
             </Text>
           </Box>
         )
@@ -365,6 +385,7 @@ export function jobsTab(kit: Kit, s: Jobs, now: number, cols: number, act: JobsA
       )}
       <Box flexDirection="row" gap={2} marginTop={1}>
         <Button key="refresh" label="Refresh" onPress={() => act.refresh()} />
+        {unownedIds(s.jobs).length > 0 && <Button key="own-all" label={`Take ${unownedIds(s.jobs).length} unowned`} onPress={() => act.own(unownedIds(s.jobs))} />}
         <Text color={COLORS.GRAY}>{s.updatedAt !== null ? `squeue ${fmtDur((now - s.updatedAt) / 1000)} ago` : ''}</Text>
       </Box>
     </Box>

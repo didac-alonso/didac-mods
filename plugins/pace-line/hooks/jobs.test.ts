@@ -8,6 +8,7 @@ import { braille, fmtNum, sparkline } from './jobs/chart'
 import { EMPTY_METRICS, addChunk, ckptNumbers, ema, etaSeconds, lossKey, newestCkpt, trend, utf8Length, valKeys } from './jobs/metrics'
 import { gpusFromTres, parseDf, parseJobDetail, parseLogTail, parseSacct, parseSqueue, resumeArgv, shellWords, slurmTime, submittedId, zoneMinutes } from './jobs/parse'
 import { items, jobsLine, progressText } from './jobs/view'
+import { baseId, jobsOp, runsSbatch, submittedIds, whose } from './jobs/owners'
 
 const NOW = Date.parse('2026-10-07T18:00:00Z')
 
@@ -279,22 +280,58 @@ function cluster(on: On, c: Cluster) {
   })
 }
 
-const startSession = async ($: Engine, on: On, submitted: string[]) => {
-  mock.store(on)
+type SessionOpts = {
+  store?: Record<string, unknown>
+  agents?: { id: string; status: string }[]
+  sent?: { to: unknown; text: string }[]
+  toasts?: string[]
+  /** What a Bash call prints beneath pace-line (an sbatch, for the capture). */
+  bash?: string
+}
+
+/** The plugin's store in memory, kept where the test can read it back. */
+function memStore(on: On, seed: Record<string, unknown> = {}): Map<string, unknown> {
+  const m = new Map(Object.entries(seed))
+  on('store.get', (_$, e) => ({ value: m.get(e.key) }))
+  on('store.set', (_$, e) => {
+    m.set(e.key, structuredClone(e.value))
+    return { value: undefined }
+  })
+  on('store.delete', (_$, e) => {
+    m.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...m.keys()] }))
+  return m
+}
+
+const startSession = async ($: Engine, on: On, submitted: string[], o: SessionOpts = {}) => {
+  const store = memStore(on, o.store)
   mock.env(on, { USER: 'demo', SLURM_JOB_ID: '10897494' })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'S1' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.cwd', () => ({ value: '/w' }))
   on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('settings.read', () => ({ value: {} }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('agent.list', () => ({ value: (o.agents ?? []).map(a => ({ ...a, type: 'pace-line:job-runner', description: 'runner' })) as never }))
+  on('session.send', (_$, e) => {
+    o.sent?.push({ to: e.to, text: e.text })
+    return { isDelivered: true }
+  })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: o.bash ?? '', stderr: '', interrupted: false } }))
   on('prompt.submit', (_$, e) => {
     submitted.push(e.text)
     return { text: e.text }
   })
   on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: '' }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => {
+    o.toasts?.push(e.text)
+    return { value: undefined }
+  })
   await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  return store
 }
 
 test('the watcher reads a running job and the band shows it', async ($, on) => {
@@ -330,13 +367,15 @@ test('a TIMEOUT with a fresh checkpoint is resubmitted with RESUME, and Claude i
   }
   cluster(on, c)
   const submitted: string[] = []
-  await startSession($, on, submitted)
+  const store = await startSession($, on, submitted, { store: { 'owner:2001': { sessionId: 'S1', at: NOW, via: 'sbatch' } } })
   await clock.settle()
 
   c.squeue = SQUEUE.split('\n')[0]!
   await clock.advance(61_000)
   await clock.settle()
 
+  // The resubmission is the same work: it stays this session's.
+  expect(store.get('owner:3001')).toMatchObject({ sessionId: 'S1', via: 'resume' })
   const sbatch = c.ran.find(a => a[0] === 'sbatch')
   expect(sbatch).toEqual(['sbatch', '--parsable', '--export=ALL,LR=3e-4,RESUME=/w/runs/2001/checkpoints/epoch=0-step=400.pt', 'slurm/train.sbatch'])
   expect(submitted).toHaveLength(1)
@@ -352,4 +391,266 @@ test('off a cluster, /jobs goes on to the plugin that owns it', async ($, on) =>
   await startSession($, on, [])
   const r = await $.command.run({ command: 'jobs', args: '' } as Parameters<typeof $.command.run>[0])
   expect(r.text).toBe('job-watch answered')
+})
+
+// ── Owners: a job's alerts wake only the Claude that launched it ──────────
+
+describe('owners', () => {
+  test('sbatch ids: the plain line, --parsable, several, and words that only contain sbatch', () => {
+    expect(submittedIds('sbatch a.sbatch', 'Submitted batch job 123\n')).toEqual(['123'])
+    expect(submittedIds('sbatch --parsable a.sbatch', '45678;explorer\n')).toEqual(['45678'])
+    // Bare numbers after --parsable only when sbatch itself ran, and job-sized.
+    expect(submittedIds('jid=$(sbatch --parsable a.sh); echo $jid; echo $?', '45678\n0\n')).toEqual(['45678'])
+    expect(submittedIds('grep -- --parsable notes.txt', '45678\n')).toEqual([])
+    expect(submittedIds('bash launch.sh', 'Submitted batch job 1\nSubmitted batch job 2\n')).toEqual(['1', '2'])
+    // Without --parsable a bare number is not an id (an echo, a count).
+    expect(submittedIds('sbatch a.sbatch; echo 7', 'Submitted batch job 9\n7\n')).toEqual(['9'])
+    expect(runsSbatch('cd /w && sbatch -p short x.sbatch')).toBe(true)
+    expect(runsSbatch('/usr/bin/sbatch x')).toBe(true)
+    expect(runsSbatch('cat slurm/train.sbatch')).toBe(false)
+    expect(runsSbatch('history | grep sbatch')).toBe(false)
+    expect(runsSbatch('PART=short sbatch -p $PART x')).toBe(true)
+    expect(runsSbatch('cd /w\nsbatch x')).toBe(true)
+    expect(runsSbatch('jid=$(sbatch --parsable x)')).toBe(true)
+    expect(runsSbatch('for s in 0 1; do sbatch --export=S=$s x; done')).toBe(true)
+    expect(runsSbatch('timeout 30 sbatch x')).toBe(true)
+    expect(runsSbatch(": drop <<'EOF'\nsbatch x\nEOF")).toBe(false)
+    expect(baseId('123+0')).toBe('123')
+    expect(baseId('2002_[3-7]')).toBe('2002')
+  })
+
+  test('`: jobs` ops: only the whole command, ids folded to their base', () => {
+    expect(jobsOp(': jobs own 2001 2002_3')).toEqual({ verb: 'own', ids: ['2001', '2002'], unowned: false })
+    expect(jobsOp(': jobs own unowned')).toEqual({ verb: 'own', ids: [], unowned: true })
+    expect(jobsOp(': jobs release 2001,2003')).toEqual({ verb: 'release', ids: ['2001', '2003'] })
+    expect(jobsOp(': jobs owners')).toEqual({ verb: 'owners' })
+    expect(jobsOp(': jobs')).toEqual({ verb: 'help' })
+    expect(jobsOp(': jobs own 1; rm -rf x')).toBeNull()
+    expect(jobsOp('echo : jobs own 1')).toBeNull()
+  })
+
+  test('whose: mine, another live session, and a session gone silent', () => {
+    const o = { sessionId: 'S2', at: NOW, via: 'sbatch' as const }
+    expect(whose(undefined, 'S1', undefined, NOW)).toBe('none')
+    expect(whose({ ...o, sessionId: 'S1' }, 'S1', undefined, NOW)).toBe('mine')
+    expect(whose(o, 'S1', NOW - 60_000, NOW)).toBe('other')
+    expect(whose(o, 'S1', NOW - 600_000, NOW)).toBe('none')
+    expect(whose(o, 'S1', undefined, NOW)).toBe('none')
+  })
+})
+
+const COMPLETED_2001 = '2001|t4-train|COMPLETED|0:0|3:20:00|/w|sbatch slurm/train.sbatch\n'
+
+/** Job 2001 runs, then ends COMPLETED one poll later; what each channel got. */
+/**
+ * Job 2001 runs, then ends COMPLETED one poll later; what each channel got.
+ * `launched`: 2001 shows up in squeue only after `before` ran (as after an sbatch).
+ */
+async function endsOnce($: Engine, on: On, o: SessionOpts & { launched?: boolean; before?: (bash: (command: string) => Promise<unknown>) => Promise<void> } = {}) {
+  const clock = mock.clock(on, { now: NOW })
+  const running = SQUEUE.split('\n').slice(0, 2).join('\n')
+  const c: Cluster = { squeue: o.launched ? SQUEUE.split('\n')[0]! : running, sacct: { '2001': COMPLETED_2001 }, ran: [], files: { '/w/runs/slurm-2001.out': LOG } }
+  cluster(on, c)
+  const submitted: string[] = []
+  const sent = o.sent ?? []
+  const toasts = o.toasts ?? []
+  const store = await startSession($, on, submitted, { ...o, sent, toasts })
+  await clock.settle()
+  const bash = (command: string) => $.tool.call({ tool: 'Bash', command } as Parameters<typeof $.tool.call>[0])
+  await o.before?.(bash)
+  if (o.launched) {
+    c.squeue = running
+    await clock.advance(61_000)
+    await clock.settle()
+  }
+  c.squeue = SQUEUE.split('\n')[0]!
+  await clock.advance(61_000)
+  await clock.settle()
+  return { submitted, sent, toasts, bash, store }
+}
+
+const stdoutOf = (r: unknown) => ((r as { result?: { stdout?: string } }).result?.stdout ?? '')
+
+test('a job this session launched with sbatch: its end reaches this Claude', async ($, on) => {
+  const r = await endsOnce($, on, { launched: true, bash: 'Submitted batch job 2001\n', before: async bash => void (await bash('sbatch slurm/train.sbatch')) })
+  expect(r.store.get('owner:2001')).toMatchObject({ sessionId: 'S1', via: 'sbatch' })
+  expect(r.submitted).toHaveLength(1)
+  expect(r.submitted[0]).toContain('t4-train (2001) completed')
+  expect(r.sent).toEqual([])
+  expect(r.toasts.some(t => t.includes('completed'))).toBe(true)
+})
+
+test('a launcher script that prints what it submitted: its jobs are this session\'s', async ($, on) => {
+  const r = await endsOnce($, on, { launched: true, bash: 'launching t4…\nSubmitted batch job 2001\n', before: async bash => void (await bash('bash scripts/launch.sh')) })
+  expect(r.store.get('owner:2001')).toMatchObject({ sessionId: 'S1', via: 'sbatch' })
+  expect(r.submitted).toHaveLength(1)
+})
+
+test('a job nobody owns: a toast, and no Claude is woken', async ($, on) => {
+  const r = await endsOnce($, on)
+  expect(r.submitted).toEqual([])
+  expect(r.toasts.some(t => t.includes('t4-train (2001) completed'))).toBe(true)
+  expect(r.toasts.some(t => t.includes('unowned: /jobs own 2001'))).toBe(true)
+})
+
+test('another live session\'s job: left to it, no toast and no Claude here', async ($, on) => {
+  const r = await endsOnce($, on, { store: { 'owner:2001': { sessionId: 'S2', at: NOW, via: 'sbatch' }, 'alive:S2': NOW + 30_000 } })
+  expect(r.submitted).toEqual([])
+  expect(r.toasts.some(t => t.includes('completed'))).toBe(false)
+})
+
+test('a job whose session went silent is nobody\'s: a toast only', async ($, on) => {
+  const r = await endsOnce($, on, { store: { 'owner:2001': { sessionId: 'S2', at: NOW, via: 'sbatch' }, 'alive:S2': NOW - 600_000 } })
+  expect(r.submitted).toEqual([])
+  expect(r.toasts.some(t => t.includes('completed'))).toBe(true)
+})
+
+test('a subagent\'s job: the alert goes back to that subagent, not to the session', async ($, on) => {
+  const r = await endsOnce($, on, {
+    store: { 'owner:2001': { sessionId: 'S1', agentId: 'a1', at: NOW, via: 'sbatch' } },
+    agents: [{ id: 'a1', status: 'completed' }],
+  })
+  expect(r.submitted).toEqual([])
+  expect(r.sent).toHaveLength(1)
+  expect(r.sent[0]!.text).toContain('alerts for jobs you launched')
+  expect(r.sent[0]!.text).toContain('t4-train (2001) completed')
+  expect(r.sent[0]!.text).toContain('[waiting]')
+})
+
+test('a stopped subagent\'s job becomes the session\'s, and the session is told', async ($, on) => {
+  const r = await endsOnce($, on, {
+    store: { 'owner:2001': { sessionId: 'S1', agentId: 'a1', at: NOW, via: 'sbatch' }, 'owner:2005': { sessionId: 'S1', agentId: 'a1', at: NOW, via: 'sbatch' } },
+    agents: [{ id: 'a1', status: 'killed' }],
+  })
+  // Never a message to it: that would revive it.
+  expect(r.sent).toEqual([])
+  expect(r.submitted).toHaveLength(1)
+  expect(r.submitted[0]).toContain('The subagent that launched 2001, 2005 is gone')
+  expect(r.store.get('owner:2001')).toEqual({ sessionId: 'S1', at: NOW + 60_000, via: 'orphan' })
+  expect(r.store.get('owner:2005')).toMatchObject({ via: 'orphan' })
+})
+
+test('`: jobs own`, `owners` and `release`: answered by pace-line, nothing runs', async ($, on) => {
+  const r = await endsOnce($, on, {
+    before: async bash => {
+      expect(stdoutOf(await bash(': jobs owners'))).toContain('2001 t4-train RUNNING: nobody')
+      expect(stdoutOf(await bash(': jobs own unowned'))).toContain('Owned by this session now: 2001 t4-train')
+      expect(stdoutOf(await bash(': jobs owners'))).toContain('2001 t4-train RUNNING: this session')
+    },
+  })
+  // Claimed, so its end reaches this Claude.
+  expect(r.submitted).toHaveLength(1)
+  expect(stdoutOf(await r.bash(': jobs release 2001'))).toContain('Released 2001')
+  expect(r.store.get('owner:2001')).toBeUndefined()
+  expect(stdoutOf(await r.bash(': jobs'))).toContain(': jobs own <id…>')
+})
+
+test('another live session\'s job is not released from here', async ($, on) => {
+  const r = await endsOnce($, on, { store: { 'owner:2001': { sessionId: 'S2', at: NOW, via: 'sbatch' }, 'alive:S2': NOW + 30_000 } })
+  expect(stdoutOf(await r.bash(': jobs release 2001'))).toContain('another live session owns them: 2001')
+  expect(r.store.get('owner:2001')).toMatchObject({ sessionId: 'S2' })
+})
+
+test('reading a log that names a job does not take it from its owner', async ($, on) => {
+  const r = await endsOnce($, on, {
+    store: { 'owner:2001': { sessionId: 'S2', at: NOW, via: 'sbatch' }, 'alive:S2': NOW + 30_000 },
+    bash: 'Submitted batch job 2001\n',
+    before: async bash => void (await bash('cat runs/launch.log')),
+  })
+  expect(r.store.get('owner:2001')).toMatchObject({ sessionId: 'S2', via: 'sbatch' })
+  expect(r.submitted).toEqual([])
+})
+
+test('another session resubmitted my TIMEOUT first: I hear "resubmitted", not a false "not resubmitted"', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const c: Cluster = {
+    squeue: SQUEUE.split('\n').slice(0, 2).join('\n'),
+    sacct: { '2001': '2001|t4-train|TIMEOUT|0:0|1-00:00:12|/w|sbatch --export=ALL,LR=3e-4 slurm/train.sbatch\n' },
+    ran: [],
+    files: { '/w/runs/slurm-2001.out': LOG, '/w/runs/2001/metrics.jsonl': METRICS, '/w/runs/2001/checkpoints/epoch=0-step=400.pt': 'x' },
+  }
+  cluster(on, c)
+  const submitted: string[] = []
+  const news = { job: '2001', kind: 'resumed', level: 'warn', text: '↻ t4-train (2001) TIMEOUT: resubmitted as 3005 from epoch=0-step=400.pt (resume 1/3)', at: NOW }
+  // What session S2 left after resubmitting it: the claim, the chain, and the news.
+  await startSession($, on, submitted, {
+    store: {
+      'owner:2001': { sessionId: 'S1', at: NOW, via: 'sbatch' },
+      'claim:2001': NOW,
+      'resumed:2001': news,
+      chains: { '2001': { root: '2001', attempts: 1, lastCkpt: '/w/runs/2001/checkpoints/epoch=0-step=400.pt', jobs: ['2001', '3005'] } },
+      chainOf: { '3005': '2001' },
+    },
+  })
+  await clock.settle()
+  c.squeue = SQUEUE.split('\n')[0]!
+  await clock.advance(61_000)
+  await clock.settle()
+
+  expect(c.ran.some(a => a[0] === 'sbatch')).toBe(false)
+  expect(submitted).toHaveLength(1)
+  expect(submitted[0]).toContain('resubmitted as 3005')
+  expect(submitted[0]).not.toContain('not resubmitted')
+})
+
+test('a quiet sbatch: the job that shows up within 2 min is guessed to be this session\'s', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // Submitted at 14:00:30 local (-0400), 30 s after the sbatch ran.
+  const QUIET = '2010|quiet|PENDING|0:00|1:00:00|1|(Priority)|gres/gpu:1||2026-10-07T14:00:30'
+  const c: Cluster = { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} }
+  cluster(on, c)
+  const store = await startSession($, on, [], { bash: '' })
+  await clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'sbatch -Q slurm/quiet.sbatch > /dev/null' } as Parameters<typeof $.tool.call>[0])
+  c.squeue = `${SQUEUE.split('\n')[0]!}\n${QUIET}`
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(store.get('owner:2010')).toMatchObject({ sessionId: 'S1', via: 'guess' })
+})
+
+test('the heartbeat has its own timer, apart from the poll', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
+  const store = await startSession($, on, [])
+  await clock.settle()
+  await clock.advance(31_000)
+  await clock.settle()
+  expect(store.get('alive:S1')).toBe(NOW + 30_000)
+})
+
+test('`: jobs` mixed with other commands is refused, not run as a plain `:`', async ($, on) => {
+  const r = await endsOnce($, on)
+  expect(stdoutOf(await r.bash(': jobs own 2001 && echo ok'))).toContain('on its own')
+  expect(r.store.get('owner:2001')).toBeUndefined()
+})
+
+test('an unowned job\'s toast says how to take it, and the panel\'s Take button does', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const c: Cluster = { squeue: SQUEUE.split('\n').slice(0, 2).join('\n'), sacct: { '2001': COMPLETED_2001 }, ran: [], files: { '/w/runs/slurm-2001.out': LOG } }
+  cluster(on, c)
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const toasts: string[] = []
+  const submitted: string[] = []
+  const store = await startSession($, on, submitted, { toasts })
+  await clock.settle()
+
+  await $.command.run({ command: 'jobs', args: '' } as Parameters<typeof $.command.run>[0])
+  const ui = await $.ui.mount({
+    plugin: 'pace-line',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'slurm-job',
+    props: { title: 'Slurm', isFocused: true, bodyColumns: 110, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  })
+  expect(await ui.find({ type: 'Text', text: '  unowned' })).toBeDefined()
+  await ui.press({ key: 'own-all' })
+  expect(store.get('owner:2001')).toMatchObject({ sessionId: 'S1', via: 'own' })
+  expect(toasts.some(t => t.includes('Owned by this session now: 2001'))).toBe(true)
+
+  // Taken: its end reaches this Claude, and no "unowned" hint.
+  c.squeue = SQUEUE.split('\n')[0]!
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(submitted).toHaveLength(1)
+  expect(toasts.some(t => t.includes('/jobs own'))).toBe(false)
 })
