@@ -596,3 +596,16 @@ test('a pace-line alert about carded jobs tells Claude where their results go', 
   await $.prompt.submit({ text: '[pace-line: batch-job alerts, from the job watcher, not typed by the user]\n✓ train (3001) completed after 2h', origin: { kind: 'plugin' }, wait: false } as never)
   expect(w.contexts.at(-1)?.some(c => c.includes('"card": "3001"'))).toBe(true)
 })
+
+test('an alert that comes before the card\'s next refresh still sees its jobs ended', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  let jobs = [run('3001', 'train')]
+  paceState(on, () => jobs)
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  jobs = [run('3001', 'train', { state: 'COMPLETED', endedAt: NOW + 16_000 })]
+  await $.prompt.submit({ text: '[pace-line: batch-job alerts, from the job watcher, not typed by the user]\n✓ train (3001) completed after 2h', origin: { kind: 'plugin' }, wait: false } as never)
+  expect(w.contexts.at(-1)?.some(c => c.includes('every job') && c.includes('"card": "3001"'))).toBe(true)
+})

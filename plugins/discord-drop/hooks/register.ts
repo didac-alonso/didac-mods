@@ -654,6 +654,8 @@ export const register: Register = (on, options) => {
     if (kind === 'composer' || kind === 'bridge') await heard($)
     // a pace-line alert about jobs with a progress card: where their results go
     if (kind === 'plugin' && cfg.jobCards && e.text.startsWith('[pace-line:')) {
+      // the alert can come before the card's next refresh: bring it up to date first
+      await jobCards($).catch(() => undefined)
       const cards = await loadCards($)
       const ids = [...new Set([...e.text.matchAll(/\((\d+(?:_\S+?)?)\)/g)].map(m => m[1]!))]
       const open = ids.map(id => [id, cardOf(cards, id)] as const).filter(([, c]) => c && c.reportedAt === null)
