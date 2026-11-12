@@ -672,6 +672,9 @@ async function deliver($: EngineInterface, d: Delivery): Promise<void> {
       const status = agents.find(x => x.id === agentId)?.status
       let isDelivered = false
       if (status !== 'killed' && status !== 'failed') {
+        // Resumed by this alert: what it hands back next is its answer, shown.
+        // (Hooks don't see a send of this plugin's own, nor, it seems, the tool calls of an agent it resumes.)
+        waiting.delete(agentId)
         try {
           isDelivered = (await $.session.send({ to: { agentId }, text: runnerText(as.map(a => a.text).join('\n'), logsOf(as)) })).isDelivered
         } catch {

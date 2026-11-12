@@ -726,6 +726,20 @@ test('`: jobs own` from a subagent makes the job that subagent\'s', async ($, on
   expect(r.submitted).toEqual([])
 })
 
+test('an alert that resumes a waiting runner ends its wait: its report then is shown', async ($, on) => {
+  const r = await endsOnce($, on, {
+    agents: [{ id: 'r1', status: 'completed' }],
+    before: async () => {
+      await $.tool.call({ tool: 'Bash', command: ': jobs own 2001', agentId: 'r1' } as never)
+      expect(stdoutOf(await $.tool.call({ tool: 'Bash', command: ': jobs wait', agentId: 'r1' } as never))).toContain('End your turn now')
+    },
+  })
+  expect(r.sent).toHaveLength(1)
+  const shown = await $.prompt.submit({ text: handBack('r1', 'Done: 2001 completed, metrics in runs/2001.'), origin: { kind: 'peer' } } as never)
+  expect((shown as { drop?: string }).drop).toBeUndefined()
+  expect(r.submitted.some(t => t.includes('Done: 2001 completed'))).toBe(true)
+})
+
 test('`: jobs wait` from a runner hides its next hand-back, whatever it says; from the main loop it only explains', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
