@@ -124,6 +124,10 @@ export type BatchJob = {
   logChangedAt: number | null
   lastLines: string[]
   progress: { k: number; n: number } | null
+  /** The last loss its log printed, when it writes no metrics file. */
+  logLoss?: { key: string; value: number } | null
+  /** Seconds per iteration, as its log prints it. */
+  secPerIt?: number | null
   flags: LogFlags
   metrics: Metrics | null
   ckpt: Ckpt | null

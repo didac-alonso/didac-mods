@@ -76,6 +76,14 @@ describe('parse', () => {
     expect(parseJobDetail(SCONTROL_2001.replace('BatchFlag=1', 'BatchFlag=0'))?.isBatch).toBe(false)
   })
 
+  test('a training loop\'s own count, loss and speed: it k/N, train_loss, ms/it', () => {
+    const t = parseLogTail('[tempo_scale s3] pinwheels_tempo_scale_ak_s3 it 300/2000 train_loss 3.9737 (3598 ms/it)\n[tempo_scale s1] eval: Edit 86.4, Acc 89.2\n')
+    expect(t.progress).toEqual({ k: 300, n: 2000 })
+    expect(t.loss).toEqual({ key: 'train_loss', value: 3.9737 })
+    expect(t.secPerIt).toBe(3.598)
+    expect(parseLogTail('step: 50/100 loss=0.41 12.5it/s\n')).toMatchObject({ progress: { k: 50, n: 100 }, loss: { key: 'loss', value: 0.41 }, secPerIt: 0.08 })
+  })
+
   test('sacct: a submit line that spans lines and holds pipes', () => {
     const a = parseSacct("2001|t4-train|TIMEOUT|0:0|1-00:00:12|/w|sbatch --export=ALL,X=1 slurm/train.sbatch\n")
     expect(a).toEqual({ jobId: '2001', name: 't4-train', state: 'TIMEOUT', exitCode: '0:0', elapsedS: 86412, workDir: '/w', submitLine: 'sbatch --export=ALL,X=1 slurm/train.sbatch' })
