@@ -34,6 +34,11 @@
       "name": "dev-relay",
       "source": "./plugins/dev-relay",
       "description": "Keeps the dev-shell alive past Slurm's time limit: a successor job takes over and every Claude session resumes there, carrying on with what it was doing."
+    },
+    {
+      "name": "handoff",
+      "source": "./plugins/handoff",
+      "description": "When the chat gets big, offers Refresh: writes a handoff of the whole chat, then clears it and leaves the handoff in the prompt box, copies it, or opens a new chat with it."
     }
   ]
 }
