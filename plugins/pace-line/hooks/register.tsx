@@ -12,7 +12,7 @@ import { SACCT_FIELDS, SQUEUE_FORMAT, parseDf, parseJobDetail, parseLogTail, par
 import { CONVENTIONS, EMPTY_JOBS, TEMPLATES, configFrom } from './jobs/state'
 import type { WatchConfig } from './jobs/state'
 import { jobsLine, jobsTab } from './jobs/view'
-import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
+import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, WAIT_TEXT, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
 import type { JobsOp, Owner, Whose } from './jobs/owners'
 
 const EMPTY: Snapshot = {
@@ -195,6 +195,8 @@ const DISCORD_SERVER = 'plugin:discord:discord'
 
 type Ctx = { user: string; ownJob: string | null; zone: number; cfg: WatchConfig }
 let ctx: Ctx | null = null
+/** Subagents that ran `: jobs wait`, until a message resumes them: their hand-backs and stop notices are kept from the main session. */
+const waiting = new Set<string>()
 /** This session's id ($.session.id()), which owns the jobs it launched. */
 let me: string | null = null
 let polling = false
@@ -698,6 +700,11 @@ async function orphan($: EngineInterface, agentId: string): Promise<string[]> {
 /** `: jobs …` and `/jobs own|release`: who owns the watched jobs, and taking or giving them up. */
 async function answerJobsOp($: EngineInterface, op: JobsOp, agentId: string | undefined): Promise<string> {
   if (op.verb === 'help') return JOBS_HELP
+  if (op.verb === 'wait') {
+    if (!agentId) return 'pace-line: `: jobs wait` is for a subagent (a job-runner) about to wait on its jobs; the main session just ends its turn.'
+    waiting.add(agentId)
+    return WAIT_TEXT
+  }
   if (!me) return 'pace-line: this session has no id yet; try again in a moment.'
   const t = await $.clock.now()
   const jobs = (await read($, jobsAtom)).jobs
@@ -1004,7 +1011,17 @@ export const register: Register = (on, options) => {
   // wake the main session for nothing. Its final report, or a problem, still comes through.
   let toldOwners = false
   on('prompt.submit', async ($, e, next) => {
+    // A waiting subagent's task-notification (it stopped, with or without a hand-back).
+    if (e.origin?.kind === 'task-notification') {
+      const task = /<task-id>([^<]+)<\/task-id>/.exec(e.text)?.[1]
+      if (task && waiting.has(task)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
+      return next(e)
+    }
     if (e.origin?.kind === 'peer') {
+      // Said with `: jobs wait` (the runner's own call, kept whatever its
+      // hand-back then says), or a job-runner's report with a `[waiting]` line.
+      const from = /^<agent-message from="([^"]+)">/.exec(e.text.trimStart())?.[1]
+      if (from && waiting.has(from)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
       const agentId = waitingFrom(e.text)
       if (agentId) {
         const agents = (await $.agent.list()) as { id: string; type: string }[]
@@ -1017,6 +1034,15 @@ export const register: Register = (on, options) => {
     const nobody = new Set((await read($, jobsAtom)).jobs.filter(j => j.endedAt === null && j.owner === 'none').map(j => baseId(j.id)))
     const count = nobody.size ? ` Right now ${nobody.size} running or pending job${nobody.size === 1 ? '' : 's'} (${[...nobody].slice(0, 8).join(', ')}) ${nobody.size === 1 ? 'is' : 'are'} unowned: mention it if the user seems to expect you to follow ${nobody.size === 1 ? 'it' : 'them'}.` : ''
     return next({ ...e, context: [...(e.context ?? []), OWN_HINT + count] })
+  }).catch(($, e, next) => next(e))
+
+  // Any message to a waiting subagent (an alert, the main session's
+  // SendMessage) ends its wait: what it answers next is shown.
+  on('session.send', async ($, e, next) => {
+    // Spelled as the SendMessage tool spells it; a plugin's `{ agentId }` may arrive as given.
+    const to = e.to as unknown
+    waiting.delete(typeof to === 'string' ? to : String((to as { agentId?: unknown } | null)?.agentId ?? ''))
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('session.compact', async ($, e, next) => {

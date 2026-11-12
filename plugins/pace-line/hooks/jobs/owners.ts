@@ -49,7 +49,7 @@ export function whose(owner: Owner | undefined, me: string, aliveAt: number | un
   return aliveAt !== undefined && now - aliveAt < staleMs ? 'other' : 'none'
 }
 
-export type JobsOp = { verb: 'own'; ids: string[]; unowned: boolean } | { verb: 'release'; ids: string[] } | { verb: 'owners' } | { verb: 'help' }
+export type JobsOp = { verb: 'own'; ids: string[]; unowned: boolean } | { verb: 'release'; ids: string[] } | { verb: 'owners' } | { verb: 'wait' } | { verb: 'help' }
 
 /** The whole command is `: jobs <verb> …` (a hook-answered no-op), else null. */
 export function jobsOp(command: string): JobsOp | null {
@@ -60,6 +60,7 @@ export function jobsOp(command: string): JobsOp | null {
   if (verb === 'own') return { verb, ids, unowned: rest.includes('unowned') }
   if (verb === 'release') return { verb, ids }
   if (verb === 'owners') return { verb }
+  if (verb === 'wait') return { verb }
   return { verb: 'help' }
 }
 
@@ -69,6 +70,7 @@ export const JOBS_HELP = [
   ': jobs own <id…>          take these jobs (from a subagent: that subagent)',
   ': jobs own unowned        take every job nobody owns',
   ': jobs release <id…>      give these jobs up: their alerts go to Discord and a toast only',
+  ': jobs wait               (a subagent) about to end its turn until its jobs\' alerts resume it: that hand-back is not shown',
 ].join('\n')
 
 export const WHOSE_TEXT: Record<Whose, string> = { mine: 'this session', other: 'another session', none: 'nobody' }
@@ -79,7 +81,7 @@ export function runnerText(alerts: string, logs: string[]): string {
     '[pace-line: alerts for jobs you launched, from the job watcher]',
     alerts,
     logs.length ? `Logs: ${logs.join(', ')}` : '',
-    'Carry on with your brief. If you launched more jobs and have nothing else to do until they end, finish your answer with a line starting [waiting].',
+    'Carry on with your brief. If you launched more jobs and have nothing else to do until they end, run `: jobs wait`, then end your turn with one `[waiting]` line.',
   ].filter(Boolean).join('\n')
 }
 
@@ -95,6 +97,8 @@ export function mainText(alerts: string, logs: string[], inherited: string[]): s
 }
 
 export const RUNNER_TYPE = 'pace-line:job-runner'
+
+export const WAIT_TEXT = 'Noted: until a message resumes you, what you hand back is kept from the main session, and each alert for your jobs resumes you. End your turn now: hand back one `[waiting]` line saying what is running and what you will do next.'
 
 /**
  * A subagent's hand-back that only says it is waiting on its jobs: the agent

@@ -695,3 +695,26 @@ test('`: jobs own` from a subagent makes the job that subagent\'s', async ($, on
   expect(r.sent).toHaveLength(1)
   expect(r.submitted).toEqual([])
 })
+
+test('`: jobs wait` from a runner hides its next hand-back, whatever it says; from the main loop it only explains', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
+  const submitted: string[] = []
+  const sent: { to: unknown; text: string }[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }], sent })
+  await clock.settle()
+  const bash = (command: string, agentId?: string) => $.tool.call({ tool: 'Bash', command, ...(agentId ? { agentId } : {}) } as never)
+  const peer = (text: string) => $.prompt.submit({ text, origin: { kind: 'peer' } } as never)
+
+  expect(stdoutOf(await bash(': jobs wait'))).toContain('is for a subagent')
+  expect(stdoutOf(await bash(': jobs wait', 'r1'))).toContain('End your turn now')
+  // The model wrote a hand-off anyway, and its stop notice follows: both kept from the main session.
+  await peer(handBack('r1', 'INCOMPLETE: the harness required a hand-back. Job 3001 is PENDING.'))
+  await $.prompt.submit({ text: '<task-notification>\n<task-id>r1</task-id>\n<status>completed</status>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
+  expect(submitted).toEqual([])
+  // An alert (or any message) resumes it: what it answers then is shown.
+  await $.session.send({ to: { agentId: 'r1' }, text: 'alert' } as never)
+  await peer(handBack('r1', 'Done: 3001 COMPLETED, value 42.'))
+  await $.prompt.submit({ text: '<task-notification>\n<task-id>r1</task-id>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
+  expect(submitted).toHaveLength(2)
+})
