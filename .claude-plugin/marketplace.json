@@ -34,6 +34,11 @@
       "name": "dev-relay",
       "source": "./plugins/dev-relay",
       "description": "Keeps the dev-shell alive past Slurm's time limit: a successor job takes over and every Claude session resumes there, carrying on with what it was doing."
+    },
+    {
+      "name": "subagent-policy",
+      "source": "./plugins/subagent-policy",
+      "description": "Makes delegating to subagents the natural move and their model and effort a conscious choice: a short guide, nudges, every Agent call naming both, and stats."
     }
   ]
 }

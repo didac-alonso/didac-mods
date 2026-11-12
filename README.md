@@ -10,6 +10,7 @@ Claude Code mods for working on a Slurm GPU cluster.
 | [discord-drop](plugins/discord-drop) | Discord cards through a webhook, only when you're away: results with their plots, finished tasks, failed or finished batch jobs, questions and permission prompts waiting for you. Silent while you work with Claude. |
 | [dev-relay](plugins/dev-relay) | Keeps the dev-shell alive past Slurm's time limit: a successor job takes over, every Claude session resumes in its herdr pane on the new node, and the ones that were working carry on. |
 | [job-watch](plugins/job-watch) | For your laptop, not the cluster: the same job watcher over one `ssh <host> bash -s` a minute, with hoverable loss, val, GPU-history and sweep charts in the desktop app. Needs an ssh alias that logs in without a prompt. |
+| [subagent-policy](plugins/subagent-policy) | Makes delegating to subagents the natural move and their model and effort a conscious choice, from criteria rather than archetypes: a short guide, nudges when main-loop work would be cheaper delegated, every Agent call naming both, and `/subagent-policy` stats of what was chosen and what it cost. |
 
 ## Install
 
@@ -28,6 +29,7 @@ On your own computer, instead:
 
 ```
 /plugin install job-watch@didac-mods
+/plugin install subagent-policy@didac-mods
 ```
 
 ## Develop
