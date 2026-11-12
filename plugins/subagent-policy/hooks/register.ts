@@ -1,7 +1,7 @@
 import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
-import { BIG_OUTPUT, CRITERIA, GUIDE, MANY_READS, MAX_LOG, isExempt, isShellRead, missing, statsText } from './policy'
-import type { Spawn } from './policy'
+import { BIG_OUTPUT, CRITERIA, GUIDE, MANY_READS, MAX_LOG, NO_NUDGES, NUDGES_KEY, isExempt, isShellRead, missing, nudgesText, statsText } from './policy'
+import type { Nudges, Spawn } from './policy'
 
 /** One store key per subagent (the store is shared by every session; get then set isn't atomic). */
 const SPAWN = 'spawn:'
@@ -27,6 +27,16 @@ async function allSpawns($: EngineInterface): Promise<{ key: string; s: Spawn }[
   return out
 }
 
+/** Counts a nudge given, or followed by a subagent. */
+async function bump($: EngineInterface, kind: keyof Nudges, field: 'given' | 'followed'): Promise<void> {
+  try {
+    const n = ((await $.store.get(NUDGES_KEY)) as Nudges | undefined) ?? NO_NUDGES
+    await $.store.set(NUDGES_KEY, { ...n, [kind]: { ...n[kind], [field]: n[kind][field] + 1 } })
+  } catch {
+    // Bookkeeping only.
+  }
+}
+
 /** Keeps the newest MAX_LOG subagents. */
 async function prune($: EngineInterface): Promise<void> {
   try {
@@ -45,6 +55,11 @@ export const register: Register = (on, options) => {
   /** Reads and searches in the current main-loop turn, and whether it was nudged. */
   let reads = 0
   let nudgedReads = false
+  /** Files the main loop edited this session, and whether it edited this turn: then it is working in them, and reads are no reason to delegate. */
+  const edited = new Set<string>()
+  let editedThisTurn = false
+  /** A nudge given in this turn or the last, waiting to see if a subagent follows it. */
+  let lastNudge: { kind: 'big' | 'reads'; turns: number } | null = null
   /** Agent tool calls waiting for their spawn: tool_use_id → store key. */
   const pending = new Map<string, string>()
   /** agentId → store key, for the turns it reports. */
@@ -91,6 +106,10 @@ export const register: Register = (on, options) => {
     }
     await $.store.set(key, s)
     pending.set(e.tool_use_id, key)
+    if (!e.agentId && lastNudge) {
+      await bump($, lastNudge.kind, 'followed')
+      lastNudge = null
+    }
     const r = await next(e)
     // Refused or failed further down: no subagent ran, so no record of one.
     if (r.deny !== undefined || r.isError) {
@@ -100,17 +119,32 @@ export const register: Register = (on, options) => {
     return r
   }).catch(($, e, next) => next(e))
 
-  // Reads and searches in a main-loop turn: one nudge past the threshold.
-  const read = async (e: { agentId?: string }, next: () => Promise<ToolCallResult>) => {
+  // Reads and searches in a main-loop turn: one nudge past the threshold,
+  // unless the turn is editing (reading the code it changes is the work).
+  const read = async (e: { agentId?: string }, next: () => Promise<ToolCallResult>, path?: string) => {
     if (e.agentId) return next()
-    reads++
+    if (!path || !edited.has(path)) reads++
     const r = await next()
-    if (r.deny !== undefined || reads < cfg.readsPerTurn || nudgedReads) return r
+    if (r.deny !== undefined || reads < cfg.readsPerTurn || nudgedReads || editedThisTurn) return r
     nudgedReads = true
+    lastNudge = { kind: 'reads', turns: 0 }
     return { ...r, context: [...(r.context ?? []), MANY_READS(reads)] }
   }
   // Read, and Grep and Glob in builds that have them (searches otherwise run through Bash).
-  on('tool.call', { tool: /^(?:Read|Grep|Glob)$/ }, (_$, e, next) => read(e, () => next(e))).catch(($, e, next) => next(e))
+  on('tool.call', { tool: /^(?:Read|Grep|Glob)$/ }, (_$, e, next) => {
+    const path = (e as { file_path?: unknown }).file_path
+    return read(e, () => next(e), typeof path === 'string' ? path : undefined)
+  }).catch(($, e, next) => next(e))
+
+  on('tool.call', { tool: /^(?:Edit|Write|NotebookEdit)$/ }, async (_$, e, next) => {
+    const r = await next(e)
+    if (!e.agentId && r.deny === undefined) {
+      const path = (e as { file_path?: unknown; notebook_path?: unknown }).file_path ?? (e as { notebook_path?: unknown }).notebook_path
+      if (typeof path === 'string') edited.add(path)
+      editedThisTurn = true
+    }
+    return r
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     if (e.agentId) return next(e)
@@ -120,6 +154,8 @@ export const register: Register = (on, options) => {
     const out = r.result as { stdout?: unknown } | undefined
     const chars = r.text?.length ?? (typeof out?.stdout === 'string' ? out.stdout.length : 0)
     if (chars < cfg.bigOutputChars) return r
+    lastNudge = { kind: 'big', turns: 0 }
+    await bump($, 'big', 'given')
     return { ...r, context: [...(r.context ?? []), BIG_OUTPUT(chars)] }
   }).catch(($, e, next) => next(e))
 
@@ -139,8 +175,12 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (!e.agentId) {
+      if (nudgedReads) await bump($, 'reads', 'given')
       reads = 0
       nudgedReads = false
+      editedThisTurn = false
+      // A nudge counts as followed by a subagent in its own turn or the next.
+      if (lastNudge && ++lastNudge.turns > 1) lastNudge = null
       return r
     }
     const key = byAgent.get(e.agentId)
@@ -162,6 +202,7 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'subagent-policy' }, async $ => {
     const t = await $.clock.now()
-    return { text: statsText((await allSpawns($)).map(x => x.s), t) }
+    const nudges = ((await $.store.get(NUDGES_KEY)) as Nudges | undefined) ?? NO_NUDGES
+    return { text: `${statsText((await allSpawns($)).map(x => x.s), t)}\n\n${nudgesText(nudges)}` }
   })
 }

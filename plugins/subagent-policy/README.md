@@ -9,10 +9,10 @@ Claude rarely delegates on its own, and when it does the subagent inherits the m
 - **Every Agent call to a generic agent names `model` and `effort`**: a `general-purpose`, `claude`, `Explore` or `Plan` call without both is refused, with the criteria, and Claude makes it again.
   - Forks and every named agent are exempt, since each carries its own model and effort: a plugin's `plugin:name`, a user or project agent, an engine helper.
   - The **Require model and effort** setting turns the refusal off.
-- **Nudges** in the main loop, one line each:
+- **Nudges** in the main loop, one line each, conditional: they say to delegate only when the conclusion is what's needed, and to carry on when the detail is needed to edit or decide. Delegating doesn't lose the detail: the guide has Claude ask the subagent for paths and line numbers, and SendMessage the same subagent for follow-ups, since it keeps what it read. A turn that edits files gets no reads nudge, and re-reading a file it edited doesn't count. The nudges fire on:
   - a Bash output over 30k characters;
   - more than 8 reads in one turn: Read, Grep or Glob, or a shell look at files (grep, rg, find, cat, head, tail, ls, `sed -n`…).
-- **`/subagent-policy`**: the subagents of the last 14 days, grouped by the model that ran and the effort. For each group it shows the count, input and output tokens, minutes and failed turns, then the latest few with their task. Use it to tune the criteria from data.
+- **`/subagent-policy`**: how often each nudge was given and followed by a subagent (to drop one that's mostly ignored), and the subagents of the last 14 days, grouped by the model that ran and the effort. For each group it shows the count, input and output tokens, minutes and failed turns, then the latest few with their task. Use it to tune the criteria from data.
 
 Thresholds are in `/plugin` → subagent-policy → configure.
 

@@ -169,3 +169,26 @@ test('reads through the shell count toward the nudge too', async ($, on) => {
   expect(ctx[7]!.join('')).toContain('8 reads')
   expect(ctx.slice(0, 7).every(c => c.length === 0)).toBe(true)
 })
+
+test('no reads nudge in a turn that edits: reading the code it changes is the work', async ($, on) => {
+  await start($, on)
+  const read = (file_path: string) => $.tool.call({ tool: 'Read', file_path } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/w/a.py', old_string: 'x', new_string: 'y' } as never)
+  const ctx: string[] = []
+  for (let i = 0; i < 10; i++) ctx.push(...((await read(`/w/f${i}.py`)).context ?? []))
+  expect(ctx).toEqual([])
+  // Next turn, no edit yet: re-reading the file it edited doesn't count either.
+  await $.turn.complete({ reason: 'answer', durationMs: 1, turnId: 't3', answer: '', isAborted: false, category: null, explanation: null, text: '' } as never)
+  for (let i = 0; i < 10; i++) ctx.push(...((await read('/w/a.py')).context ?? []))
+  expect(ctx).toEqual([])
+})
+
+test('the nudges say when to carry on, and the stats show whether a subagent followed them', async ($, on) => {
+  await start($, on, 'x'.repeat(40_000))
+  const big = await $.tool.call({ tool: 'Bash', command: 'cat big.log' } as never)
+  expect((big.context ?? []).join('')).toContain('If you need it here to edit or decide, carry on')
+  await agent($, { subagent_type: 'general-purpose', model: 'haiku', effort: 'low' })
+  const stats = await $.command.run({ command: 'subagent-policy', args: '' } as never)
+  expect(stats.text).toContain('big output: 1 given, 1 followed by a subagent (100%)')
+  expect(GUIDE).toContain('SendMessage the same subagent')
+})

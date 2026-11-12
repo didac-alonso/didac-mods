@@ -9,6 +9,7 @@ Every Agent call you make names \`model\` and \`effort\`: the user asked for thi
 - Effort, by how deep the reasoning goes, not by how important the task is: sweep and summarise → low; a clear, scoped task → medium; debugging, verifying, designing → high, or more for the hardest.
 - The cost of an error: what redoing it would cost against what delegating saves.
 Calibration from this account, as examples rather than rules: extracting the metrics of 15 training logs → haiku, low; an independent review of a concurrency-heavy diff → opus, high (it found two real bugs); a weight-space-editing experiment on a Qwen model → opus, max.
+Delegating doesn't lose the detail. A subagent keeps what it read: for a follow-up, SendMessage the same subagent rather than re-reading. Ask it for paths and line numbers, so you read only the lines you need. So delegate when you need the conclusion; read it yourself when you are about to edit those files, or need the detail to decide.
 Brief a subagent as a peer: the goal, what you already ruled out, the files, and what to return. Ask for the detail you need, without a length cap when it matters.`
 
 export const CRITERIA = `subagent-policy: name \`model\` and \`effort\` on this Agent call (the user asked for it), chosen for this task:
@@ -17,9 +18,19 @@ export const CRITERIA = `subagent-policy: name \`model\` and \`effort\` on this 
 - weigh what redoing a wrong answer costs against what delegating saves.
 Then make the call again with both.`
 
-export const BIG_OUTPUT = (chars: number) => `subagent-policy: that output was ${Math.round(chars / 1000)}k characters, now re-read on every later turn. Next time, reading like this (a long log, a big listing) is cheaper delegated to a subagent that returns only what you need.`
+export const BIG_OUTPUT = (chars: number) => `subagent-policy: that output was ${Math.round(chars / 1000)}k characters, now re-read on every later turn. If you only needed what it says (a log, a listing), reading like this is cheaper delegated: the subagent keeps the detail for follow-ups. If you need it here to edit or decide, carry on.`
 
-export const MANY_READS = (n: number) => `subagent-policy: ${n} reads and searches this turn. If more are coming and you only need the conclusion, a subagent can sweep them and report back.`
+export const MANY_READS = (n: number) => `subagent-policy: ${n} reads and searches this turn. Only if you need just the conclusion: a subagent can sweep the rest and report back with paths and lines, and answer follow-ups. If you are going to edit these files or need the detail to decide, carry on here.`
+
+/** How often each nudge was given, and how often a subagent followed it. */
+export type Nudges = { big: { given: number; followed: number }; reads: { given: number; followed: number } }
+export const NUDGES_KEY = 'nudges'
+export const NO_NUDGES: Nudges = { big: { given: 0, followed: 0 }, reads: { given: 0, followed: 0 } }
+
+export function nudgesText(n: Nudges): string {
+  const one = (name: string, x: { given: number; followed: number }) => `${name}: ${x.given} given, ${x.followed} followed by a subagent${x.given ? ` (${Math.round((100 * x.followed) / x.given)}%)` : ''}`
+  return `Nudges: ${one('big output', n.big)}; ${one('many reads', n.reads)}.`
+}
 
 /**
  * The generic agents, whose model and effort the call has to choose. Every
