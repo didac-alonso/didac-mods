@@ -1,0 +1,32 @@
+{
+  "name": "subagent-policy",
+  "version": "0.1.0",
+  "description": "Makes delegating to subagents the natural move and the model and effort a conscious choice: a short guide, nudges when work in the main loop would be cheaper delegated, every Agent call naming its model and effort, and stats of what was chosen.",
+  "author": {
+    "name": "Dídac"
+  },
+  "license": "MIT",
+  "userConfig": {
+    "bigOutputChars": {
+      "type": "number",
+      "title": "Big output (characters)",
+      "description": "A Bash output in the main loop this long gets a one-line nudge to delegate that kind of reading.",
+      "required": false,
+      "default": 30000
+    },
+    "readsPerTurn": {
+      "type": "number",
+      "title": "Reads per turn",
+      "description": "After this many Read, Grep and Glob calls in one main-loop turn, a one-line nudge to delegate the search.",
+      "required": false,
+      "default": 8
+    },
+    "requireChoice": {
+      "type": "boolean",
+      "title": "Require model and effort",
+      "description": "Refuse an Agent call that doesn't name both, with the criteria to choose them. Off: the guide and nudges only.",
+      "required": false,
+      "default": true
+    }
+  }
+}
