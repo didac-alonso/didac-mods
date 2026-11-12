@@ -12,6 +12,8 @@ import { SACCT_FIELDS, SQUEUE_FORMAT, parseDf, parseJobDetail, parseLogTail, par
 import { CONVENTIONS, EMPTY_JOBS, TEMPLATES, configFrom } from './jobs/state'
 import type { WatchConfig } from './jobs/state'
 import { jobsLine, jobsTab } from './jobs/view'
+import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, runnerText, runsSbatch, submittedIds, whose } from './jobs/owners'
+import type { JobsOp, Owner, Whose } from './jobs/owners'
 
 const EMPTY: Snapshot = {
   model: null,
@@ -193,6 +195,8 @@ const DISCORD_SERVER = 'plugin:discord:discord'
 
 type Ctx = { user: string; ownJob: string | null; zone: number; cfg: WatchConfig }
 let ctx: Ctx | null = null
+/** This session's id ($.session.id()), which owns the jobs it launched. */
+let me: string | null = null
 let polling = false
 let paneOpen = false
 let disksAt = 0
@@ -262,8 +266,12 @@ async function startWatch($: EngineInterface, cfg: WatchConfig, ownJob: string |
   if (!user || (await run($, ['squeue', '--version'], { timeoutMs: 5_000 })) === null) return false
   const z = await run($, ['date', '+%z'], { timeoutMs: 5_000 })
   ctx = { user, ownJob, zone: zoneMinutes(z ?? '+0000'), cfg }
+  await forgetOld($)
+  await beat($)
   await poll($)
   $.clock.every(cfg.pollSeconds * 1000, () => poll($))
+  // Apart from the poll, which can run long (ssh to GPU nodes, slow sacct) or be set slow.
+  $.clock.every(HEARTBEAT_MS, () => beat($))
   $.clock.every(cfg.gpuSeconds * 1000, async () => {
     if (!paneOpen) return
     const s = await read($, jobsAtom)
@@ -422,6 +430,8 @@ async function poll($: EngineInterface): Promise<void> {
         }
         if (d) j = { ...j, jobId: d.jobId, workDir: d.workDir, stdout: d.stdout, command: d.command, nodeList: d.nodeList || j.nodeList }
       }
+      // An id-less sbatch is recorded when its Bash call returns, which may be after this poll first saw the job.
+      if (!known || (j.submittedAt !== null && t - j.submittedAt < GUESS_MS + cfg.pollSeconds * 1000)) await guessOwner($, j, t)
       if (j.state === 'RUNNING') j = await readFiles($, j)
       next.push(j)
     }
@@ -462,9 +472,10 @@ async function poll($: EngineInterface): Promise<void> {
       if (df !== null) disks = parseDf(df).filter((d, i, all) => all.findIndex(x => x.mount === d.mount) === i)
     }
 
+    const owners = await whoseAll($, next.map(j => j.id), t)
     await update($, jobsAtom, s => ({
       ...s,
-      jobs: next,
+      jobs: next.map(j => ({ ...j, owner: owners.get(baseId(j.id))?.whose ?? 'none' })),
       selected: s.selected ?? next[0]?.id ?? null,
       updatedAt: t,
       error: null,
@@ -478,36 +489,143 @@ async function poll($: EngineInterface): Promise<void> {
       const r = await maybeResume($, j, false)
       if (r) fresh.push(r)
     }
-    await deliver($, await unseen($, fresh))
+    // A resubmission another session made after this one saw the job end.
+    fresh.push(...(await resumeNews($, (await read($, jobsAtom)).jobs.filter(j => !ended.some(x => x.id === j.id) && j.owner === 'mine'))))
+    await route($, fresh, owners, t)
   } finally {
     polling = false
   }
 }
 
-/** Alerts not yet raised for that job and kind, by any session (the store is shared). */
-async function unseen($: EngineInterface, alerts: Alert[]): Promise<Alert[]> {
+/** Alerts not yet raised for that job and kind under `key`: the shared 'alerted' (by any session) or one session's own. */
+async function unseen($: EngineInterface, alerts: Alert[], key = 'alerted'): Promise<Alert[]> {
   if (!alerts.length) return []
   const t = await $.clock.now()
-  const seen = ((await $.store.get('alerted')) ?? {}) as Record<string, number>
+  const seen = ((await $.store.get(key)) ?? {}) as Record<string, number>
   const out = alerts.filter(a => seen[`${a.job}:${a.kind}`] === undefined)
   if (!out.length) return []
   const kept = Object.fromEntries(Object.entries(seen).filter(([, at]) => t - at < 7 * 86400_000))
   for (const a of out) kept[`${a.job}:${a.kind}`] = t
-  await $.store.set('alerted', kept)
+  await $.store.set(key, kept)
   return out
 }
 
-/** Toasts each alert, then one Discord message and one message to Claude for the batch. */
-async function deliver($: EngineInterface, alerts: Alert[]): Promise<void> {
-  if (!alerts.length || !ctx) return
-  const { cfg } = ctx
-  for (const a of alerts) $.ui.toast(a.text, { timeoutMs: a.level === 'error' ? 30_000 : 15_000 })
-  await update($, jobsAtom, s => ({ ...s, alerts: [...alerts, ...s.alerts].slice(0, 20) }))
+// ── Job owners: a job's alerts wake only the session (or subagent) that launched it ──
 
-  const text = alerts.map(a => a.text).join('\n')
+/** The heartbeat other sessions read: while it is fresh, this session's jobs are left to it. */
+async function beat($: EngineInterface): Promise<void> {
+  if (me) await $.store.set(ALIVE + me, await $.clock.now())
+}
+
+/** How old another session's heartbeat may be: a slow poll setting stretches it. */
+const staleMs = () => Math.max(STALE_MS, 3 * (ctx?.cfg.pollSeconds ?? 60) * 1000)
+
+type OwnerInfo = { whose: Whose; owner?: Owner }
+
+async function ownerOf($: EngineInterface, id: string): Promise<Owner | undefined> {
+  const o = await $.store.get(OWNER + baseId(id))
+  return o && typeof o === 'object' && typeof (o as Owner).sessionId === 'string' ? (o as Owner) : undefined
+}
+
+async function setOwner($: EngineInterface, id: string, o: Owner): Promise<void> {
+  await $.store.set(OWNER + baseId(id), o)
+}
+
+/** Each job's owner as seen from this session, keyed by base id; one heartbeat read per owning session. */
+async function whoseAll($: EngineInterface, ids: readonly string[], t: number): Promise<Map<string, OwnerInfo>> {
+  const out = new Map<string, OwnerInfo>()
+  const alive = new Map<string, number | undefined>()
+  for (const id of ids.map(baseId)) {
+    if (out.has(id)) continue
+    const owner = await ownerOf($, id)
+    if (owner && owner.sessionId !== me && !alive.has(owner.sessionId)) alive.set(owner.sessionId, (await $.store.get(ALIVE + owner.sessionId)) as number | undefined)
+    out.set(id, { whose: whose(owner, me ?? '', owner ? alive.get(owner.sessionId) : undefined, t, staleMs()), owner })
+  }
+  return out
+}
+
+/** sbatch ran in a session (or a subagent of it): its printed ids are that caller's jobs. */
+async function recordSbatch($: EngineInterface, command: string, stdout: string, agentId: string | undefined, before: ReadonlySet<string>): Promise<void> {
+  if (!me) return
+  const t = await $.clock.now()
+  const ids = submittedIds(command, stdout)
+  for (const id of ids) {
+    if (before.has(id)) continue
+    // Never over a real owner: only a guess gives way to the sbatch that printed the id.
+    const was = await ownerOf($, id)
+    if (was && was.via !== 'guess') continue
+    await setOwner($, id, { sessionId: me, ...(agentId ? { agentId } : {}), at: t, via: 'sbatch' })
+  }
+  if (ids.length || !runsSbatch(command)) return
+  // An sbatch that printed no id (quiet, or output sent elsewhere): the job that shows up next is taken to be this caller's.
+  const last = ((await $.store.get(LAST_SBATCH)) ?? {}) as Record<string, { at: number; agentId?: string }>
+  last[me] = { at: t, ...(agentId ? { agentId } : {}) }
+  await $.store.set(LAST_SBATCH, last)
+}
+
+/** A job nobody claimed, submitted right after exactly one session ran an id-less sbatch, is that session's. */
+async function guessOwner($: EngineInterface, j: BatchJob, t: number): Promise<void> {
+  if (j.submittedAt === null || (await ownerOf($, j.id))) return
+  const last = ((await $.store.get(LAST_SBATCH)) ?? {}) as Record<string, { at: number; agentId?: string }>
+  const near = Object.entries(last).filter(([, s]) => Math.abs((j.submittedAt ?? 0) - s.at) <= GUESS_MS)
+  if (near.length !== 1) return
+  const [sessionId, s] = near[0]!
+  await setOwner($, j.id, { sessionId, ...(s.agentId ? { agentId: s.agentId } : {}), at: t, via: 'guess' })
+}
+
+/** Drops heartbeats, dedup records and owners of sessions and jobs not heard of for a week. */
+async function forgetOld($: EngineInterface): Promise<void> {
+  try {
+    const t = await $.clock.now()
+    for (const key of await $.store.keys()) {
+      if (key.startsWith(ALIVE)) {
+        const at = (await $.store.get(key)) as number | undefined
+        if (at === undefined || t - at > FORGET_MS) {
+          await $.store.delete(key)
+          await $.store.delete(SEEN + key.slice(ALIVE.length))
+        }
+      } else if (key.startsWith(OWNER)) {
+        const o = (await $.store.get(key)) as Owner | undefined
+        if (!o || t - o.at > 2 * FORGET_MS) await $.store.delete(key)
+      }
+    }
+  } catch {
+    // Housekeeping only.
+  }
+}
+
+/**
+ * Splits a pass's alerts by owner. Discord hears every alert once (whichever
+ * session sees it first); this session's own jobs reach its Claude (or the
+ * subagent that launched them) and its toasts; a job nobody owns gets a toast
+ * once and no Claude; another live session's jobs are left to it.
+ */
+async function route($: EngineInterface, fresh: Alert[], owners: Map<string, OwnerInfo>, t: number): Promise<void> {
+  if (!fresh.length) return
+  const info = new Map(owners)
+  for (const a of fresh) if (!info.has(baseId(a.job))) info.set(baseId(a.job), (await whoseAll($, [a.job], t)).get(baseId(a.job))!)
+  const of = (a: Alert) => info.get(baseId(a.job)) ?? { whose: 'none' as const }
+  const shared = await unseen($, fresh)
+  const mine = me ? await unseen($, fresh.filter(a => of(a).whose === 'mine'), SEEN + me) : []
+  const nobody = shared.filter(a => of(a).whose === 'none')
+  await deliver($, { discord: shared, local: [...mine, ...nobody.filter(a => !mine.includes(a))], claude: mine, info })
+}
+
+type Delivery = { discord: Alert[]; local: Alert[]; claude: Alert[]; info?: Map<string, OwnerInfo> }
+
+/** Toasts, one Discord message, and the alerts for Claude: to the subagent that launched the job, else to the session. */
+async function deliver($: EngineInterface, d: Delivery): Promise<void> {
+  if (!ctx) return
+  const { cfg } = ctx
+  for (const a of d.local) $.ui.toast(a.text, { timeoutMs: a.level === 'error' ? 30_000 : 15_000 })
+  if (d.local.length) await update($, jobsAtom, s => ({ ...s, alerts: [...d.local, ...s.alerts].slice(0, 20) }))
+
+  const text = d.discord.map(a => a.text).join('\n')
   // A start is news for the person, not work for Claude.
-  const forClaude = alerts.filter(a => a.kind !== 'started')
-  if (cfg.discordChatId) {
+  const forClaude = d.claude.filter(a => a.kind !== 'started')
+  if (!d.discord.length) {
+    // Discord already heard these (another session saw them first).
+  } else if (cfg.discordChatId) {
     try {
       await $.mcp.call(DISCORD_SERVER, 'reply', { chat_id: cfg.discordChatId, text })
     } catch {
@@ -520,19 +638,101 @@ async function deliver($: EngineInterface, alerts: Alert[]): Promise<void> {
 
   if (!forClaude.length) return
   const jobs = (await read($, jobsAtom)).jobs
-  const logs = [...new Set(forClaude.map(a => jobs.find(j => j.id === a.job)?.stdout).filter(Boolean))]
+  const logsOf = (as: Alert[]) => [...new Set(as.map(a => jobs.find(j => j.id === a.job)?.stdout).filter((p): p is string => !!p))]
+
+  // A subagent's jobs go back to it, resumed if it already answered. One that
+  // was stopped or failed would be revived by a message: its jobs become the session's.
+  const byAgent = new Map<string, Alert[]>()
+  const toMain: Alert[] = []
+  for (const a of forClaude) {
+    const agentId = d.info?.get(baseId(a.job))?.owner?.agentId
+    if (agentId) byAgent.set(agentId, [...(byAgent.get(agentId) ?? []), a])
+    else toMain.push(a)
+  }
+  const inherited: string[] = []
+  if (byAgent.size) {
+    let agents: { id: string; status: string }[] = []
+    try {
+      agents = (await $.agent.list()) as { id: string; status: string }[]
+    } catch {
+      // No agent list: each send says whether it got through.
+    }
+    for (const [agentId, as] of byAgent) {
+      const status = agents.find(x => x.id === agentId)?.status
+      let isDelivered = false
+      if (status !== 'killed' && status !== 'failed') {
+        try {
+          isDelivered = (await $.session.send({ to: { agentId }, text: runnerText(as.map(a => a.text).join('\n'), logsOf(as)) })).isDelivered
+        } catch {
+          isDelivered = false
+        }
+      }
+      if (isDelivered) continue
+      inherited.push(...(await orphan($, agentId)))
+      toMain.push(...as)
+    }
+  }
+  if (!toMain.length) return
   try {
-    await $.prompt.submit({
-      text: [
-        '[pace-line: batch-job alerts, from the job watcher, not typed by the user]',
-        forClaude.map(a => a.text).join('\n'),
-        logs.length ? `Logs: ${logs.join(', ')}` : '',
-        'For a failure, read the end of its log and propose a fix. Do not resubmit unless the user asks: pace-line already resubmits TIMEOUTs from their latest checkpoint. For an idle GPU, a silent log or a long pending job, check it and say what you would do. For a resubmission, update the project EXPERIMENTS.md row if there is one. Keep it short.',
-      ].filter(Boolean).join('\n'),
-    })
+    await $.prompt.submit({ text: mainText(toMain.map(a => a.text).join('\n'), logsOf(toMain), inherited) })
   } catch {
     // No session to tell (claude -p): the toasts stand.
   }
+}
+
+/** A subagent of this session is gone: every job it owned becomes the session's. Returns their ids. */
+async function orphan($: EngineInterface, agentId: string): Promise<string[]> {
+  const t = await $.clock.now()
+  const ids: string[] = []
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(OWNER)) continue
+    const o = (await $.store.get(key)) as Owner | undefined
+    if (o?.agentId !== agentId || o.sessionId !== me) continue
+    await $.store.set(key, { sessionId: o.sessionId, at: t, via: 'orphan' } satisfies Owner)
+    ids.push(key.slice(OWNER.length))
+  }
+  return ids
+}
+
+/** `: jobs …` and `/jobs own|release`: who owns the watched jobs, and taking or giving them up. */
+async function answerJobsOp($: EngineInterface, op: JobsOp, agentId: string | undefined): Promise<string> {
+  if (op.verb === 'help') return JOBS_HELP
+  if (!me) return 'pace-line: this session has no id yet; try again in a moment.'
+  const t = await $.clock.now()
+  const jobs = (await read($, jobsAtom)).jobs
+  const info = await whoseAll($, jobs.map(j => j.id), t)
+  const nameOf = (id: string) => jobs.find(j => baseId(j.id) === id)?.name
+  const tag = (id: string) => `${id}${nameOf(id) ? ` ${nameOf(id)}` : ''}`
+
+  if (op.verb === 'owners') {
+    if (!jobs.length) return 'No batch jobs are watched.'
+    const seen = new Set<string>()
+    return jobs.filter(j => !seen.has(baseId(j.id)) && seen.add(baseId(j.id))).map(j => {
+      const i = info.get(baseId(j.id))
+      const agent = i?.whose === 'mine' && i.owner?.agentId ? ` (subagent ${i.owner.agentId})` : ''
+      return `${baseId(j.id)} ${j.name} ${j.state}: ${WHOSE_TEXT[i?.whose ?? 'none']}${agent}`
+    }).join('\n')
+  }
+
+  if (op.verb === 'own') {
+    const ids = [...new Set([
+      ...op.ids,
+      ...(op.unowned ? jobs.filter(j => j.endedAt === null && info.get(baseId(j.id))?.whose === 'none').map(j => baseId(j.id)) : []),
+    ])]
+    if (!ids.length) return op.unowned ? 'No running or pending job is unowned.' : 'Name the jobs: `: jobs own <id…>` or `: jobs own unowned`.'
+    for (const id of ids) await setOwner($, id, { sessionId: me, ...(agentId ? { agentId } : {}), at: t, via: 'own' })
+    const who = agentId ? 'this subagent' : 'this session'
+    const taken = ids.filter(id => info.get(id)?.whose === 'other')
+    return `Owned by ${who} now: ${ids.map(tag).join(', ')}.${taken.length ? ` Taken from another session: ${taken.join(', ')}.` : ''} Their alerts come here.`
+  }
+
+  const released = op.ids.filter(id => info.get(id)?.whose !== 'other')
+  const refused = op.ids.filter(id => info.get(id)?.whose === 'other')
+  for (const id of released) await $.store.delete(OWNER + id)
+  return [
+    released.length ? `Released ${released.map(tag).join(', ')}: their alerts go to Discord and a toast only, until someone runs \`: jobs own\`.` : '',
+    refused.length ? `Not released, another live session owns them: ${refused.join(', ')}.` : '',
+  ].filter(Boolean).join(' ') || 'Name the jobs: `: jobs release <id…>`.'
 }
 
 async function webhook($: EngineInterface, url: string, text: string): Promise<void> {
@@ -555,6 +755,8 @@ async function maybeResume($: EngineInterface, j: BatchJob, force: boolean): Pro
   const t = await $.clock.now()
   const stop = (text: string): Alert => ({ job: j.id, kind: 'resumeStopped', level: 'error', text: `↻ ${label(j)}: not resubmitted, ${text}`, at: t })
   if (!force && !RESUMABLE.has(j.state)) return null
+  // Another session resubmitted it first: its news, if written yet (resumeNews picks it up later).
+  if (!force && (await $.store.get(`claim:${j.jobId}`))) return ((await $.store.get(NEWS + j.jobId)) as Alert | undefined) ?? null
   if (j.arrayId) return stop('it is an array task; resubmit the sweep by hand')
   const ckpt = j.ckpt
   if (!ckpt || (j.startedAt !== null && ckpt.mtimeMs < j.startedAt)) return stop(`no checkpoint written by this run in ${runDir(j) ?? 'its run dir'}`)
@@ -580,14 +782,34 @@ async function maybeResume($: EngineInterface, j: BatchJob, force: boolean): Pro
   chainOf[id] = root
   await $.store.set('chains', chains)
   await $.store.set('chainOf', chainOf)
+  // The resubmission is the same work: its alerts go where the first job's did.
+  const owner = await ownerOf($, j.id)
+  if (owner) await setOwner($, id, { ...owner, at: t, via: 'resume' })
   await update($, jobsAtom, s => ({ ...s, jobs: s.jobs.map(x => (x.id === j.id ? { ...x, resumedAs: id } : x)) }))
-  return {
+  const news: Alert = {
     job: j.id,
     kind: 'resumed',
     level: 'warn',
     text: `↻ ${label(j)} ${j.state}: resubmitted as ${id} from ${ckpt.name} (resume ${chain.attempts + 1}/${ctx.cfg.maxResumes})`,
     at: t,
   }
+  // For the owner, when another session did the resubmitting.
+  await $.store.set(NEWS + j.jobId, news)
+  return news
+}
+
+/** Ended jobs another session resubmitted, whose news this session has not raised: the owner hears of it too. */
+async function resumeNews($: EngineInterface, jobs: readonly BatchJob[]): Promise<Alert[]> {
+  const out: Alert[] = []
+  for (const j of jobs) {
+    if (j.endedAt === null || j.resumedAs || !RESUMABLE.has(j.state)) continue
+    const news = (await $.store.get(NEWS + j.jobId)) as Alert | undefined
+    if (!news) continue
+    out.push(news)
+    const id = /resubmitted as (\d+)/.exec(news.text)?.[1] ?? null
+    if (id) await update($, jobsAtom, s => ({ ...s, jobs: s.jobs.map(x => (x.id === j.id ? { ...x, resumedAs: id } : x)) }))
+  }
+  return out
 }
 
 /** /jobs resume <id>: the same resubmission, asked for by the user. */
@@ -596,7 +818,7 @@ async function resumeByHand($: EngineInterface, id: string): Promise<string> {
   if (!j) return `No job ${id} in the list.`
   if (j.endedAt === null) return `Job ${id} is still ${j.state}.`
   const a = await maybeResume($, j, true)
-  if (a) await deliver($, [a])
+  if (a) await deliver($, { discord: [a], local: [a], claude: [] })
   return a?.text ?? `Job ${id} was not resubmitted.`
 }
 
@@ -636,6 +858,11 @@ function tempColor(c: number): string {
   return COLORS.GREEN
 }
 
+/** claim:<jobId>'s resubmitted alert, for the owner when another session resubmitted the job. */
+const NEWS = 'resumed:'
+
+const OWN_HINT = 'pace-line: a batch job\'s alerts reach only the session (or subagent) whose sbatch launched it; a job nobody owns (launched from a terminal, or its session gone) only gets a toast and Discord. When the user asks you to take, watch or give up a job, run `: jobs own <id…>` (or `: jobs own unowned`), `: jobs release <id…>`, or `: jobs owners` to list them: a Bash no-op pace-line answers, nothing runs.'
+
 const gib = (mib: number) => (mib / 1024).toFixed(1)
 const pct = (used: number | null, total: number | null) => (used !== null && total ? (used / total) * 100 : null)
 
@@ -645,6 +872,11 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    try {
+      me = await $.session.id()
+    } catch {
+      me = null
+    }
     const [model, usage, t] = await Promise.all([$.session.model(), $.session.usage(), $.clock.now()])
     // The session's effective level (a --effort flag included) as it hands
     // it to Bash; then the saved one. A turn's request corrects either.
@@ -683,8 +915,8 @@ export const register: Register = (on, options) => {
       if (ok) {
         await $.command.register({
           name: 'jobs',
-          description: 'Batch jobs: progress, loss, GPUs, checkpoints. /jobs init adds the run helpers here; /jobs resume <id>',
-          argumentHint: '[init | resume <id>]',
+          description: 'Batch jobs: progress, loss, GPUs, checkpoints. /jobs init adds the run helpers here; /jobs resume <id>; /jobs own|release <id> picks whose Claude gets a job\'s alerts',
+          argumentHint: '[init | resume <id> | own <id…|unowned> | release <id…> | owners]',
         })
       }
     })
@@ -730,9 +962,56 @@ export const register: Register = (on, options) => {
     // (job-watch, watching the cluster from a laptop).
     if (!isWatching) return next(e)
     if (sub === 'resume' && arg) return { text: await resumeByHand($, arg) }
+    if (sub === 'own' || sub === 'release' || sub === 'owners') {
+      const op = jobsOp(`: jobs ${e.args.trim()}`)
+      return { text: await answerJobsOp($, op ?? { verb: 'help' }, undefined) }
+    }
     await openPanel($, 'jobs')
     return { text: 'Opened the batch jobs panel.' }
   })
+
+  // `: jobs …` is answered here (nothing runs); an sbatch's printed ids make
+  // its jobs the caller's, the subagent's when a subagent ran it.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const command = typeof e.command === 'string' ? e.command : ''
+    const answer = (stdout: string) => ({ result: { stdout, stderr: '', interrupted: false } })
+    const op = jobsOp(command)
+    if (op) return answer(isWatching ? await answerJobsOp($, op, e.agentId) : 'pace-line is not watching batch jobs in this session (no Slurm here, or it is still starting).')
+    // `: jobs own 1 && …` would run as a plain `:`: say so rather than let it look done.
+    if (/^\s*:\s+jobs\b/.test(command)) return answer('pace-line: run `: jobs …` on its own, with nothing else on the line.')
+    if (!isWatching) return next(e)
+    // Jobs already watched before this call are not its submissions (a log that names them, squeue).
+    const before = new Set((await read($, jobsAtom)).jobs.map(j => baseId(j.id)))
+    const ran = await next(e)
+    if (!ran.deny && !ran.isError) {
+      try {
+        const out = ran.result as { stdout?: unknown } | undefined
+        const stdout = typeof out?.stdout === 'string' ? out.stdout : ran.text ?? ''
+        // sbatch itself, or a launcher script that printed what it submitted.
+        if (mayHaveIds(command, stdout)) await recordSbatch($, command, stdout, e.agentId, before)
+      } catch {
+        // The call stands; the job is unowned until claimed.
+      }
+    }
+    return ran
+  }).catch(($, e, next) => next(e))
+
+  // Once a session, and again after a compaction: how to take a job, so
+  // "take job N" just works, and how many watched jobs nobody owns.
+  let toldOwners = false
+  on('prompt.submit', async ($, e, next) => {
+    if (toldOwners || !isWatching || e.origin?.kind !== 'composer') return next(e)
+    toldOwners = true
+    const nobody = new Set((await read($, jobsAtom)).jobs.filter(j => j.endedAt === null && j.owner === 'none').map(j => baseId(j.id)))
+    const count = nobody.size ? ` Right now ${nobody.size} running or pending job${nobody.size === 1 ? '' : 's'} (${[...nobody].slice(0, 8).join(', ')}) ${nobody.size === 1 ? 'is' : 'are'} unowned: mention it if the user seems to expect you to follow ${nobody.size === 1 ? 'it' : 'them'}.` : ''
+    return next({ ...e, context: [...(e.context ?? []), OWN_HINT + count] })
+  }).catch(($, e, next) => next(e))
+
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    toldOwners = false
+    return r
+  }).catch(($, e, next) => next(e))
 
   // The run conventions, so jobs Claude writes in any project report themselves.
   on('prompt.compose', async ($, e, next) => {

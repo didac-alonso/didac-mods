@@ -11,6 +11,10 @@ import { SWEEP_COLORS, braille, fmtNum, rangeOf, sparkline } from './chart'
 import type { Line, Run } from './chart'
 import { ema, etaSeconds, lossKey, lowerIsBetter, stepRate, trend, valKeys } from './metrics'
 
+/** Whose Claude gets a job's alerts: the list row tags the jobs that are not this session's. */
+const OWNER_TAG = { other: 'other session', none: 'unowned' } as const
+const OWNER_TEXT = { mine: 'alerts: this session', other: 'alerts: another session', none: 'alerts: nobody (`: jobs own` to take it)' } as const
+
 export type Item =
   | { kind: 'job'; key: string; job: BatchJob }
   | { kind: 'array'; key: string; arrayId: string; name: string; tasks: BatchJob[] }
@@ -204,7 +208,7 @@ function jobDetail(kit: Kit, j: BatchJob, s: Jobs, now: number, cols: number, ac
         <Text color={g.color}>{`${g.glyph} ${j.state}${j.reason ? ` (${j.reason})` : ''}`}</Text>
       </Box>
       <Text color={COLORS.GRAY} wrap="truncate-end">
-        {[j.nodeList || null, gpuText(j), j.workDir, j.resumedFrom && `resumed from ${j.resumedFrom}`, j.resumedAs && `resubmitted as ${j.resumedAs}`].filter(Boolean).join(' · ')}
+        {[j.nodeList || null, gpuText(j), j.workDir, j.resumedFrom && `resumed from ${j.resumedFrom}`, j.resumedAs && `resubmitted as ${j.resumedAs}`, j.owner && OWNER_TEXT[j.owner]].filter(Boolean).join(' · ')}
       </Text>
       {j.limitS !== null && j.elapsedS !== null && (
         <Text>
@@ -347,6 +351,7 @@ export function jobsTab(kit: Kit, s: Jobs, now: number, cols: number, act: JobsA
               <Text color={COLORS.GRAY}>{gpuText(j) ? `  ${gpuText(j)}` : ''}</Text>
               <Text color={PLAIN}>{progressText(j) ? `  ${progressText(j)}` : ''}</Text>
               <Text color={COLORS.GRAY}>{j.state === 'PENDING' && j.reason ? `  ${j.reason}` : ''}</Text>
+              <Text color={COLORS.GRAY}>{j.owner && j.owner !== 'mine' ? `  ${OWNER_TAG[j.owner]}` : ''}</Text>
             </Text>
           </Box>
         )

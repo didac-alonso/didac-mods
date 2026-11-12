@@ -132,6 +132,8 @@ export type BatchJob = {
   idleSince: number | null
   resumedFrom: string | null
   resumedAs: string | null
+  /** Whose Claude gets its alerts, seen from this session: this one, another live one, or nobody. */
+  owner?: 'mine' | 'other' | 'none'
 }
 
 export type Disk = { mount: string; size: number; used: number; avail: number }
