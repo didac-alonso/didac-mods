@@ -98,6 +98,8 @@ export function mainText(alerts: string, logs: string[], inherited: string[]): s
 
 export const RUNNER_TYPE = 'pace-line:job-runner'
 
+export const WAIT_NOTHING = 'pace-line: you own no running or pending job, so nothing would resume you. Don\'t wait: finish your brief, or hand back a report of what happened (if you launched jobs, say how: their ids were not seen, so they are not yours).'
+
 export const WAIT_TEXT = 'Noted: until a message resumes you, what you hand back is kept from the main session, and each alert for your jobs resumes you. End your turn now: hand back one `[waiting]` line saying what is running and what you will do next.'
 
 /**
@@ -106,6 +108,18 @@ export const WAIT_TEXT = 'Noted: until a message resumes you, what you hand back
  * with the report indented; `[waiting]` starts a line of it.
  */
 export function waitingFrom(text: string): string | null {
-  const m = /^<agent-message from="([^"]+)">/.exec(text.trimStart())
-  return m && /^\s*\[waiting\]/m.test(text) ? m[1]! : null
+  const from = handBackFrom(text)
+  if (!from) return null
+  // Only a report that is just the `[waiting]` status (and at most one line
+  // before it): tables, or a problem, followed by `[waiting]` for the jobs still running, are shown.
+  // The harness indents every line of the report (its own frame lines are not).
+  const lines = text.split('\n').filter(l => l.startsWith('  ')).map(l => l.trim()).filter(Boolean)
+  const last = lines.at(-1) ?? ''
+  return /^\[waiting\]/.test(last) && lines.length <= 2 && lines.join('\n').length < 600 ? from : null
+}
+
+/** The agent a prompt is a hand-back from, when it holds exactly one: two batched together are shown. */
+export function handBackFrom(text: string): string | null {
+  const all = [...text.matchAll(/^\s*<agent-message from="([^"]+)">/gm)]
+  return all.length === 1 && text.trimStart().startsWith('<agent-message') ? all[0]![1]! : null
 }

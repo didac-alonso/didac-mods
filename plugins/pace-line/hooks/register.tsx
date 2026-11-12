@@ -12,7 +12,7 @@ import { SACCT_FIELDS, SQUEUE_FORMAT, parseDf, parseJobDetail, parseLogTail, par
 import { CONVENTIONS, EMPTY_JOBS, TEMPLATES, configFrom } from './jobs/state'
 import type { WatchConfig } from './jobs/state'
 import { jobsLine, jobsTab } from './jobs/view'
-import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, WAIT_TEXT, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
+import { ALIVE, FORGET_MS, GUESS_MS, HEARTBEAT_MS, JOBS_HELP, STALE_MS, LAST_SBATCH, OWNER, SEEN, WHOSE_TEXT, baseId, jobsOp, mainText, mayHaveIds, RUNNER_TYPE, WAIT_NOTHING, WAIT_TEXT, handBackFrom, runnerText, runsSbatch, submittedIds, waitingFrom, whose } from './jobs/owners'
 import type { JobsOp, Owner, Whose } from './jobs/owners'
 
 const EMPTY: Snapshot = {
@@ -683,6 +683,21 @@ async function deliver($: EngineInterface, d: Delivery): Promise<void> {
   }
 }
 
+/** Whether a subagent owns a job not ended: running or pending, or submitted in the last 10 min and not polled yet. */
+async function ownsLiveJob($: EngineInterface, agentId: string): Promise<boolean> {
+  const t = await $.clock.now()
+  const jobs = (await read($, jobsAtom)).jobs
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(OWNER)) continue
+    const o = (await $.store.get(key)) as Owner | undefined
+    if (o?.agentId !== agentId || o.sessionId !== me) continue
+    const id = key.slice(OWNER.length)
+    const listed = jobs.filter(j => baseId(j.id) === id)
+    if (listed.some(j => j.endedAt === null) || (!listed.length && t - o.at < 10 * 60_000)) return true
+  }
+  return false
+}
+
 /** A subagent of this session is gone: every job it owned becomes the session's. Returns their ids. */
 async function orphan($: EngineInterface, agentId: string): Promise<string[]> {
   const t = await $.clock.now()
@@ -702,6 +717,8 @@ async function answerJobsOp($: EngineInterface, op: JobsOp, agentId: string | un
   if (op.verb === 'help') return JOBS_HELP
   if (op.verb === 'wait') {
     if (!agentId) return 'pace-line: `: jobs wait` is for a subagent (a job-runner) about to wait on its jobs; the main session just ends its turn.'
+    // Only with a job of its own still to come: else nothing would ever resume it.
+    if (!(await ownsLiveJob($, agentId))) return WAIT_NOTHING
     waiting.add(agentId)
     return WAIT_TEXT
   }
@@ -1020,7 +1037,7 @@ export const register: Register = (on, options) => {
     if (e.origin?.kind === 'peer') {
       // Said with `: jobs wait` (the runner's own call, kept whatever its
       // hand-back then says), or a job-runner's report with a `[waiting]` line.
-      const from = /^<agent-message from="([^"]+)">/.exec(e.text.trimStart())?.[1]
+      const from = handBackFrom(e.text)
       if (from && waiting.has(from)) return { drop: 'pace-line: the subagent is waiting on its jobs' }
       const agentId = waitingFrom(e.text)
       if (agentId) {
@@ -1036,12 +1053,25 @@ export const register: Register = (on, options) => {
     return next({ ...e, context: [...(e.context ?? []), OWN_HINT + count] })
   }).catch(($, e, next) => next(e))
 
-  // Any message to a waiting subagent (an alert, the main session's
-  // SendMessage) ends its wait: what it answers next is shown.
+  // A waiting subagent resumed by anything (an alert, the main session's
+  // SendMessage by id or name) is no longer waiting: what it answers next is shown.
+  on('agent.spawn', async ($, e, next) => {
+    const resumed = (e as { resume?: { agentId?: string } }).resume?.agentId
+    if (resumed) waiting.delete(resumed)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('session.send', async ($, e, next) => {
     // Spelled as the SendMessage tool spells it; a plugin's `{ agentId }` may arrive as given.
     const to = e.to as unknown
     waiting.delete(typeof to === 'string' ? to : String((to as { agentId?: unknown } | null)?.agentId ?? ''))
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // `: jobs wait` is meant to be the runner's last call before it hands back.
+  // Any other work after it (it found a problem, it went on) ends the wait.
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId && waiting.has(e.agentId) && (e.tool as string) !== 'SubagentHandback' && !(e.tool === 'Bash' && jobsOp(String((e as { command?: unknown }).command ?? ''))?.verb === 'wait')) waiting.delete(e.agentId)
     return next(e)
   }).catch(($, e, next) => next(e))
 

@@ -321,6 +321,7 @@ const startSession = async ($: Engine, on: On, submitted: string[], o: SessionOp
     return { isDelivered: true }
   })
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: o.bash ?? '', stderr: '', interrupted: false } }))
+  on('agent.spawn', (_$, e) => ({ model: 'claude-sonnet-5-5', agentId: (e as { resume?: { agentId?: string } }).resume?.agentId ?? 'new' }) as never)
   on('prompt.submit', (_$, e) => {
     submitted.push(e.text)
     return { text: e.text }
@@ -664,6 +665,10 @@ test('waitingFrom: a hand-back whose report has a [waiting] line', () => {
   expect(waitingFrom(handBack('a1', 'Launched a1, a2.\n[waiting] 3001, 3002 running; next: tea-a3'))).toBe('a1')
   expect(waitingFrom(handBack('a1', 'All done: table below. Not [waiting] anymore.'))).toBeNull()
   expect(waitingFrom('[waiting] typed by someone')).toBeNull()
+  // A real report that ends with `[waiting]` for the jobs still running is shown.
+  expect(waitingFrom(handBack('a1', 'a2 FAILED: CUDA OOM at step 1200, outside the brief.\n| run | state |\n| a1 | RUNNING |\n| a2 | FAILED |\n[waiting] a1 running'))).toBeNull()
+  // Two hand-backs batched in one prompt: shown.
+  expect(waitingFrom(handBack('a1', '[waiting] x') + '\n' + handBack('a2', 'real report'))).toBeNull()
 })
 
 test('a job-runner\'s [waiting] hand-back is dropped; its report, and other agents\' [waiting], are not', async ($, on) => {
@@ -701,7 +706,7 @@ test('`: jobs wait` from a runner hides its next hand-back, whatever it says; fr
   cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
   const submitted: string[] = []
   const sent: { to: unknown; text: string }[] = []
-  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }], sent })
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }], sent, store: { 'owner:3001': { sessionId: 'S1', agentId: 'r1', at: NOW, via: 'sbatch' } } })
   await clock.settle()
   const bash = (command: string, agentId?: string) => $.tool.call({ tool: 'Bash', command, ...(agentId ? { agentId } : {}) } as never)
   const peer = (text: string) => $.prompt.submit({ text, origin: { kind: 'peer' } } as never)
@@ -717,4 +722,31 @@ test('`: jobs wait` from a runner hides its next hand-back, whatever it says; fr
   await peer(handBack('r1', 'Done: 3001 COMPLETED, value 42.'))
   await $.prompt.submit({ text: '<task-notification>\n<task-id>r1</task-id>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
   expect(submitted).toHaveLength(2)
+})
+
+test('`: jobs wait` is refused to a runner with no live job, and any later work, or a resume by name, ends the wait', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })
+  const submitted: string[] = []
+  await startSession($, on, submitted, { agents: [{ id: 'r1', status: 'completed' }, { id: 'r2', status: 'completed' }], store: { 'owner:3002': { sessionId: 'S1', agentId: 'r2', at: NOW, via: 'sbatch' } } })
+  await clock.settle()
+  const bash = (command: string, agentId?: string) => $.tool.call({ tool: 'Bash', command, ...(agentId ? { agentId } : {}) } as never)
+  const peer = (text: string) => $.prompt.submit({ text, origin: { kind: 'peer' } } as never)
+
+  // r1 owns nothing: nothing would resume it.
+  expect(stdoutOf(await bash(': jobs wait', 'r1'))).toContain('you own no running or pending job')
+  await peer(handBack('r1', 'INCOMPLETE: hand-back required.'))
+  expect(submitted).toHaveLength(1)
+
+  // r2 waits, then goes on working and finds a problem: its report is shown.
+  expect(stdoutOf(await bash(': jobs wait', 'r2'))).toContain('End your turn now')
+  await bash('df -h /scratch', 'r2')
+  await peer(handBack('r2', 'Disk quota exceeded on /scratch: stopping.'))
+  expect(submitted).toHaveLength(2)
+
+  // r2 waits again; the main session resumes it by name (a resume spawn): its answer is shown.
+  await bash(': jobs wait', 'r2')
+  await $.agent.spawn({ tool_use_id: 'toolu_plugin_1', prompt: 'status?', description: 'runner', subagentType: 'pace-line:job-runner', background: true, resume: { agentId: 'r2' } } as never)
+  await peer(handBack('r2', 'Status: 3002 RUNNING, epoch 3/10.'))
+  expect(submitted).toHaveLength(3)
 })
