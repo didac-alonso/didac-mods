@@ -786,6 +786,21 @@ test('a [waiting] hand-back right after a tee\'d sbatch is kept back: the claim 
   expect(submitted).toEqual([])
 })
 
+test('reading a claim file or a log does not take its jobs; a claim beats such a capture', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const c: Cluster = { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} }
+  cluster(on, c)
+  const st = await startSession($, on, [], { agents: [{ id: 'r1', status: 'completed' }], bash: 'Submitted batch job 2002\n', store: { 'owner:2001': { sessionId: 'S1', agentId: 'r1', at: NOW, via: 'sbatch' }, 'owner:2003': { sessionId: 'S1', at: NOW, via: 'sbatch' } } })
+  await clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'cat ~/.cache/pace-line/claims/r1' } as never)
+  expect(st.get('owner:2002')).toBeUndefined()
+  c.files['/home/demo/.cache/pace-line/claims/r1'] = 'Submitted batch job 2002\nSubmitted batch job 2003\n'
+  await clock.advance(61_000)
+  await clock.settle()
+  expect(st.get('owner:2002')).toMatchObject({ agentId: 'r1' })
+  expect(st.get('owner:2003')).toMatchObject({ agentId: 'r1' })
+})
+
 test('`: jobs wait` from a runner hides its next hand-back, whatever it says; from the main loop it only explains', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   cluster(on, { squeue: SQUEUE.split('\n')[0]!, sacct: {}, ran: [], files: {} })

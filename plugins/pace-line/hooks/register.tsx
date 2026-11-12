@@ -611,7 +611,8 @@ async function readClaims($: EngineInterface, t: number): Promise<void> {
     const fresh: string[] = []
     for (const id of submittedIds('', text)) {
       const was = await ownerOf($, id)
-      if (was && was.via !== 'guess') continue
+      // A claim names the subagent that ran the sbatch: it beats this session's own guess or capture without one.
+      if (was && (was.agentId === agentId || was.sessionId !== me || was.agentId || was.via === 'own' || was.via === 'orphan')) continue
       await setOwner($, id, { sessionId: me, agentId, at: t, via: 'sbatch' })
       fresh.push(id)
     }

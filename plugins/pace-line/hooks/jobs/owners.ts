@@ -32,8 +32,11 @@ const SBATCH = /(?:^|[;&|(`{!\n]|\$\(|\b(?:do|then|else)\s)\s*(?:(?:env|nohup|co
 /** Whether a shell command runs sbatch itself (a wrapper script that does is seen by its printed ids). A `: op` heredoc only mentions it. */
 export const runsSbatch = (command: string) => !/^\s*:\s/.test(command) && SBATCH.test(command)
 
-/** Whether a Bash call's output may name submitted jobs. */
-export const mayHaveIds = (command: string, stdout: string) => stdout.includes('Submitted batch job') || runsSbatch(command)
+/** A command that only reads files or logs: what it prints was submitted earlier, maybe by someone else. */
+const READS = /^\s*(?:cd\s+\S+\s*&&\s*)?(?:cat|head|tail|grep|egrep|rg|less|more|zcat|awk|jq|wc|sed\s+-n)\b/
+
+/** Whether a Bash call's output may name jobs it submitted. */
+export const mayHaveIds = (command: string, stdout: string) => runsSbatch(command) || (stdout.includes('Submitted batch job') && !READS.test(command))
 
 /** Every job id an sbatch call printed: "Submitted batch job N", or bare ids under --parsable. */
 export function submittedIds(command: string, stdout: string): string[] {
