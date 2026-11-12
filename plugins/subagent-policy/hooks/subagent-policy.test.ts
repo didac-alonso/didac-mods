@@ -2,15 +2,20 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { GUIDE, isExempt, missing, statsText } from './policy'
+import { GUIDE, isExempt, isShellRead, missing, statsText } from './policy'
 import type { Spawn } from './policy'
 
 const NOW = Date.parse('2026-11-12T18:00:00Z')
 
 describe('policy', () => {
-  test('exempt: forks, plugin agents and the engine helpers; not the general agents', () => {
-    for (const t of ['fork', 'pace-line:job-runner', 'statusline-setup', 'claude-code-guide', 'web-fetch']) expect(isExempt(t)).toBe(true)
-    for (const t of ['general-purpose', 'Explore', 'Plan', 'claude', undefined]) expect(isExempt(t)).toBe(false)
+  test('exempt: forks and every named agent (plugin, user, helper); not the generic ones', () => {
+    for (const t of ['fork', 'pace-line:job-runner', 'statusline-setup', 'claude-code-guide', 'web-fetch', 'my-project-agent']) expect(isExempt(t)).toBe(true)
+    for (const t of ['general-purpose', 'Explore', 'Plan', 'claude', '', undefined]) expect(isExempt(t)).toBe(false)
+  })
+
+  test('shell reads: searches and file looks, not runs', () => {
+    for (const c of ['grep -rn loss logs/', 'cd /w && rg TODO', 'tail -n 50 x.log', "sed -n '1,40p' f.py", 'ls runs/']) expect(isShellRead(c)).toBe(true)
+    for (const c of ['python train.py', 'sbatch x.sbatch', 'git status', ': drop <<EOF']) expect(isShellRead(c)).toBe(false)
   })
 
   test('missing: both named, one, none, or an effort that is no level', () => {
@@ -125,4 +130,42 @@ test('many reads in one turn: one nudge, and the count starts over next turn', a
   expect(ctx[7]!.join('')).toContain('8 reads')
   await $.turn.complete({ reason: 'answer', durationMs: 1, turnId: 't2', answer: '', isAborted: false, category: null, explanation: null, text: '' } as never)
   for (let i = 0; i < 7; i++) expect((await read()).context ?? []).toEqual([])
+})
+
+test('a first prompt another plugin drops does not use up the guide', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  memStore(on)
+  const prompts: { context: readonly string[] }[] = []
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  // Beneath: a plugin (pace-line) that drops a waiting runner's notice.
+  on('prompt.submit', (_$, e) => {
+    if (e.origin?.kind === 'task-notification') return { drop: 'waiting' } as never
+    prompts.push({ context: e.context ?? [] })
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: '<task-notification>…</task-notification>', origin: { kind: 'task-notification' } } as never)
+  await $.prompt.submit({ text: 'hola', origin: { kind: 'composer' } } as never)
+  expect(prompts[0]!.context.includes(GUIDE)).toBe(true)
+})
+
+test('an Agent call refused further down leaves no record', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = memStore(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('tool.call', { tool: 'Agent' }, () => ({ deny: 'another plugin said no' }))
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const r = await agent($, { subagent_type: 'general-purpose', model: 'haiku', effort: 'low' })
+  expect(r.deny).toBe('another plugin said no')
+  expect([...store.keys()].filter(k => k.startsWith('spawn:'))).toEqual([])
+})
+
+test('reads through the shell count toward the nudge too', async ($, on) => {
+  await start($, on)
+  const ctx: string[][] = []
+  for (let i = 0; i < 8; i++) ctx.push([...((await $.tool.call({ tool: 'Bash', command: `grep -n loss logs/run${i}.log` } as never)).context ?? [])])
+  expect(ctx[7]!.join('')).toContain('8 reads')
+  expect(ctx.slice(0, 7).every(c => c.length === 0)).toBe(true)
 })

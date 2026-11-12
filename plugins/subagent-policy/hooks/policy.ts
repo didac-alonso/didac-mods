@@ -22,16 +22,19 @@ export const BIG_OUTPUT = (chars: number) => `subagent-policy: that output was $
 export const MANY_READS = (n: number) => `subagent-policy: ${n} reads and searches this turn. If more are coming and you only need the conclusion, a subagent can sweep them and report back.`
 
 /**
- * Agent calls that don't have to name a model and effort: a fork inherits this
- * session's by design, a plugin's agent (`plugin:name`) carries its own in its
- * definition, and the engine's small helpers have theirs.
+ * The generic agents, whose model and effort the call has to choose. Every
+ * other type is exempt: a fork inherits this session's by design, and a named
+ * agent (a plugin's `plugin:name`, a user or project agent, an engine helper)
+ * carries its own in its definition.
  */
-const HELPERS = new Set(['fork', 'statusline-setup', 'claude-code-guide', 'web-fetch'])
+const GENERIC = new Set(['', 'general-purpose', 'claude', 'Explore', 'Plan'])
 
 export function isExempt(subagentType: string | undefined): boolean {
-  const t = subagentType ?? ''
-  return HELPERS.has(t) || t.includes(':')
+  return !GENERIC.has(subagentType ?? '')
 }
+
+/** A shell command that only looks at files: a search or a read, as a Read, Grep or Glob would. */
+export const isShellRead = (command: string) => /^\s*(?:cd\s+\S+\s*&&\s*)?(?:grep|rg|find|cat|head|tail|ls|tree|sed\s+-n|wc|zcat|jq)\b/.test(command)
 
 const LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 

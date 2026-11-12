@@ -6,12 +6,12 @@ Claude rarely delegates on its own, and when it does the subagent inherits the m
   - It says what is worth delegating: long logs, broad searches, numbers out of results, papers, batch edits, parallel pieces, an independent review, and launch-and-wait Slurm work through `pace-line:job-runner`. It also says what to keep in the main loop.
   - It gives the criteria for choosing: the model by how much judgement the task needs; the effort by how deep the reasoning goes, not how important the task is; and the cost of an error.
   - A few calibration examples from this account illustrate the criteria, without making them rules.
-- **Every Agent call names `model` and `effort`**: a call without both is refused, with the criteria, and Claude makes it again.
-  - Forks, plugin agents (`plugin:name`, which carry their own model and effort) and the engine's helpers (`statusline-setup`, `claude-code-guide`, `web-fetch`) are exempt.
+- **Every Agent call to a generic agent names `model` and `effort`**: a `general-purpose`, `claude`, `Explore` or `Plan` call without both is refused, with the criteria, and Claude makes it again.
+  - Forks and every named agent are exempt, since each carries its own model and effort: a plugin's `plugin:name`, a user or project agent, an engine helper.
   - The **Require model and effort** setting turns the refusal off.
 - **Nudges** in the main loop, one line each:
   - a Bash output over 30k characters;
-  - more than 8 Read, Grep or Glob calls in one turn.
+  - more than 8 reads in one turn: Read, Grep or Glob, or a shell look at files (grep, rg, find, cat, head, tail, ls, `sed -n`…).
 - **`/subagent-policy`**: the subagents of the last 14 days, grouped by the model that ran and the effort. For each group it shows the count, input and output tokens, minutes and failed turns, then the latest few with their task. Use it to tune the criteria from data.
 
 Thresholds are in `/plugin` → subagent-policy → configure.

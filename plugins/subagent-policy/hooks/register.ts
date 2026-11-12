@@ -1,11 +1,10 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
-import { BIG_OUTPUT, CRITERIA, GUIDE, MANY_READS, MAX_LOG, isExempt, missing, statsText } from './policy'
+import { BIG_OUTPUT, CRITERIA, GUIDE, MANY_READS, MAX_LOG, isExempt, isShellRead, missing, statsText } from './policy'
 import type { Spawn } from './policy'
 
 /** One store key per subagent (the store is shared by every session; get then set isn't atomic). */
 const SPAWN = 'spawn:'
-const READS = new Set(['Read', 'Grep', 'Glob'])
 
 type Cfg = { bigOutputChars: number; readsPerTurn: number; requireChoice: boolean }
 
@@ -50,6 +49,7 @@ export const register: Register = (on, options) => {
   const pending = new Map<string, string>()
   /** agentId → store key, for the turns it reports. */
   const byAgent = new Map<string, string>()
+  const byAgentKeys = () => new Set(byAgent.values())
 
   on('session.start', async ($, e, next) => {
     const r = await next(e)
@@ -62,8 +62,10 @@ export const register: Register = (on, options) => {
   // the first turn (the user, an alert, a schedule): not on a subagent's hand-back.
   on('prompt.submit', async ($, e, next) => {
     if (told || e.origin?.kind === 'peer') return next(e)
-    told = true
-    return next({ ...e, context: [...(e.context ?? []), GUIDE] })
+    const r = await next({ ...e, context: [...(e.context ?? []), GUIDE] })
+    // A prompt another plugin dropped (a waiting runner's notice) carried nothing: the next one does.
+    if (r.drop === undefined) told = true
+    return r
   }).catch(($, e, next) => next(e))
 
   on('session.compact', async ($, e, next) => {
@@ -72,52 +74,62 @@ export const register: Register = (on, options) => {
     return r
   }).catch(($, e, next) => next(e))
 
-  on('tool.call', async ($, e, next) => {
-    if (e.tool === 'Agent') {
-      const input = e as unknown as { subagent_type?: string; model?: unknown; effort?: unknown; description?: string }
-      if (cfg.requireChoice && !isExempt(input.subagent_type)) {
-        const lack = missing(input)
-        if (lack.length) return { deny: `${CRITERIA}\n(missing: ${lack.join(' and ')})` }
-      }
-      const key = `${SPAWN}${e.tool_use_id}`
-      const s: Spawn = {
-        at: await $.clock.now(),
-        description: String(input.description ?? '').slice(0, 120),
-        type: input.subagent_type || 'general-purpose',
-        model: typeof input.model === 'string' ? input.model : null,
-        effort: typeof input.effort === 'string' ? input.effort : null,
-        background: false,
-      }
-      await $.store.set(key, s)
-      pending.set(e.tool_use_id, key)
-      return next(e)
+  on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    const input = e as unknown as { subagent_type?: string; model?: unknown; effort?: unknown; description?: string }
+    if (cfg.requireChoice && !isExempt(input.subagent_type)) {
+      const lack = missing(input)
+      if (lack.length) return { deny: `${CRITERIA}\n(missing: ${lack.join(' and ')})` }
     }
-    if (e.agentId) return next(e)
+    const key = `${SPAWN}${e.tool_use_id}`
+    const s: Spawn = {
+      at: await $.clock.now(),
+      description: String(input.description ?? '').slice(0, 120),
+      type: input.subagent_type || 'general-purpose',
+      model: typeof input.model === 'string' ? input.model : null,
+      effort: typeof input.effort === 'string' ? input.effort : null,
+      background: false,
+    }
+    await $.store.set(key, s)
+    pending.set(e.tool_use_id, key)
+    const r = await next(e)
+    // Refused or failed further down: no subagent ran, so no record of one.
+    if (r.deny !== undefined || r.isError) {
+      pending.delete(e.tool_use_id)
+      if (!byAgentKeys().has(key)) await $.store.delete(key)
+    }
+    return r
+  }).catch(($, e, next) => next(e))
 
-    if (READS.has(e.tool)) {
-      reads++
-      const r = await next(e)
-      if (r.deny !== undefined || reads < cfg.readsPerTurn || nudgedReads) return r
-      nudgedReads = true
-      return { ...r, context: [...(r.context ?? []), MANY_READS(reads)] }
-    }
-    if (e.tool === 'Bash') {
-      const r = await next(e)
-      if (r.deny !== undefined) return r
-      const out = r.result as { stdout?: unknown; stderr?: unknown } | undefined
-      const chars = r.text?.length ?? (typeof out?.stdout === 'string' ? out.stdout.length : 0)
-      if (chars < cfg.bigOutputChars) return r
-      return { ...r, context: [...(r.context ?? []), BIG_OUTPUT(chars)] }
-    }
-    return next(e)
+  // Reads and searches in a main-loop turn: one nudge past the threshold.
+  const read = async (e: { agentId?: string }, next: () => Promise<ToolCallResult>) => {
+    if (e.agentId) return next()
+    reads++
+    const r = await next()
+    if (r.deny !== undefined || reads < cfg.readsPerTurn || nudgedReads) return r
+    nudgedReads = true
+    return { ...r, context: [...(r.context ?? []), MANY_READS(reads)] }
+  }
+  // Read, and Grep and Glob in builds that have them (searches otherwise run through Bash).
+  on('tool.call', { tool: /^(?:Read|Grep|Glob)$/ }, (_$, e, next) => read(e, () => next(e))).catch(($, e, next) => next(e))
+
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    if (e.agentId) return next(e)
+    // A look at files through the shell counts as a read.
+    const r = isShellRead(String(e.command ?? '')) ? await read(e, () => next(e)) : await next(e)
+    if (r.deny !== undefined) return r
+    const out = r.result as { stdout?: unknown } | undefined
+    const chars = r.text?.length ?? (typeof out?.stdout === 'string' ? out.stdout.length : 0)
+    if (chars < cfg.bigOutputChars) return r
+    return { ...r, context: [...(r.context ?? []), BIG_OUTPUT(chars)] }
   }).catch(($, e, next) => next(e))
 
   // What actually ran: the agent's id and resolved model.
   on('agent.spawn', async ($, e, next) => {
     const r = await next(e)
     const key = pending.get(e.tool_use_id)
-    if (!key || r.deny || !r.agentId) return r
+    if (!key) return r
     pending.delete(e.tool_use_id)
+    if (r.deny !== undefined || !r.agentId) return r
     byAgent.set(r.agentId, key)
     const s = (await $.store.get(key)) as Spawn | undefined
     if (s) await $.store.set(key, { ...s, agentId: r.agentId, ranOn: r.model, background: e.background } satisfies Spawn)
