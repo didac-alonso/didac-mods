@@ -129,6 +129,7 @@ export function alertDrop(a: PaceAlert, job: PaceJob | undefined, lang: Lang, im
     final: false,
     force: false,
     card: null,
+    labels: null,
     author: job ? `${job.name} (${job.id})` : `job ${a.job}`,
     footer: `job ${a.job}`,
   }

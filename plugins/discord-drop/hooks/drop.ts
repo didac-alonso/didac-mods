@@ -27,6 +27,8 @@ export type Drop = {
   force: boolean
   /** A job id: these results replace that job's progress card. */
   card: string | null
+  /** With "card": what each job is, by job id or job name, shown on its line instead of the raw name. */
+  labels: Record<string, string> | null
   author: string | null
   footer: string | null
 }
@@ -36,6 +38,9 @@ export type Route = 'ping' | 'silent' | 'hold'
 
 export const MAX_FILES = 10
 export const MAX_FILE_BYTES = 10 * 1024 * 1024
+/** Labels per card, and the length of one. */
+export const MAX_LABELS = 100
+export const LABEL_CHARS = 80
 
 /** The shell no-op Claude sends a card with; the mod answers it, so nothing runs. */
 export const OP_LINE = /^\s*:\s+drop\b/
@@ -68,10 +73,23 @@ const isSafePath = (p: string) => p.startsWith('/') && !/["\\\n\r;]/.test(p)
 
 /** A Drop from Claude's op, or why not. */
 export function dropFrom(raw: Raw): Drop | string {
-  const kind = (KINDS as readonly string[]).includes(str(raw.kind)) ? (str(raw.kind) as Kind) : raw.key !== undefined && raw.progress !== undefined ? 'progress' : 'done'
   const title = str(raw.title)
   const text = str(raw.text)
-  if (!title && !text) return `discord-drop: a drop needs a title or a text, e.g.\n${EXAMPLE}`
+  const card = str(raw.card)
+  if (raw.labels !== undefined && (!raw.labels || typeof raw.labels !== 'object' || Array.isArray(raw.labels))) {
+    return 'discord-drop: labels is an object, {"<job id or job name>": "what that job is"}.'
+  }
+  const labelPairs = Object.entries((raw.labels as Raw | undefined) ?? {})
+    .map(([k, v]) => [k.trim().slice(0, 200), cut(str(v).replace(/\s+/g, ' '), LABEL_CHARS)] as const)
+    .filter(([k, v]) => k && v)
+  if (labelPairs.length > MAX_LABELS) return `discord-drop: at most ${MAX_LABELS} labels per card.`
+  if (labelPairs.length && !card) return 'discord-drop: labels go with "card": "<one of its job ids>" (they name the lines of that job card).'
+  const labels = labelPairs.length ? Object.fromEntries(labelPairs) : null
+  // labels name a card's lines: a drop of them alone is the card's progress op, not its results
+  const named = (KINDS as readonly string[]).includes(str(raw.kind)) ? (str(raw.kind) as Kind) : null
+  const kind: Kind = named ?? ((raw.key !== undefined && raw.progress !== undefined) || labels ? 'progress' : 'done')
+  if (labels && kind !== 'progress') return 'discord-drop: labels go in the "kind": "progress" drop that names a job card (with "card"), not in its results.'
+  if (!title && !text && !labels) return `discord-drop: a drop needs a title or a text, e.g.\n${EXAMPLE}`
   const fields: Field[] = []
   if (raw.fields !== undefined && !Array.isArray(raw.fields)) return 'discord-drop: fields is a list of {"name","value","inline"}.'
   for (const f of (raw.fields as unknown[] | undefined) ?? []) {
@@ -95,7 +113,6 @@ export function dropFrom(raw: Raw): Drop | string {
   if (progress !== null) progress = Math.max(0, Math.min(1, progress > 1 ? progress / 100 : progress))
   let eta = num(raw.eta)
   if (eta !== null && eta > 1e12) eta = Math.round(eta / 1000)
-  const card = str(raw.card)
   if (kind === 'progress' && !key && !card) return 'discord-drop: a progress card needs a key, so later updates edit it.'
   if (card && !/^\d+(?:[_+][\w\[\]-]+)?$/.test(card)) return `discord-drop: card is a job id (e.g. "11823960"), got ${cut(card, 40)}.`
   return {
@@ -112,9 +129,24 @@ export function dropFrom(raw: Raw): Drop | string {
     final: raw.final === true,
     force: raw.force === true,
     card: card || null,
+    labels,
     author: str(raw.author) || null,
     footer: str(raw.footer) || null,
   }
+}
+
+// What an sbatch printed, read as pace-line reads it (a copy of its jobs/owners.ts: this mod can't import pace-line's files).
+const SBATCH = /(?:^|[;&|(`{!\n]|\$\(|\b(?:do|then|else)\s)\s*(?:(?:env|nohup|command|time|xargs|srun|timeout\s+\S+)\s+)*(?:\w+=\S*\s+)*(?:\S*\/)?sbatch(?=\s|$)/
+const READS = /^\s*(?:cd\s+\S+\s*&&\s*)?(?:cat|head|tail|grep|egrep|rg|less|more|zcat|awk|jq|wc|sed\s+-n)\b/
+/** Whether a shell command runs sbatch itself; a `: op` heredoc only mentions it. */
+export const runsSbatch = (command: string) => !/^\s*:\s/.test(command) && SBATCH.test(command)
+
+/** The jobs a Bash call submitted: "Submitted batch job N" (not from a command that only reads a log), or bare ids under --parsable. */
+export function launchedIds(command: string, stdout: string): string[] {
+  if (!runsSbatch(command) && (!stdout.includes('Submitted batch job') || READS.test(command))) return []
+  const ids = [...stdout.matchAll(/Submitted batch job (\d+)/g)].map(m => m[1]!)
+  if (/--parsable\b/.test(command) && runsSbatch(command)) ids.push(...[...stdout.matchAll(/^(\d{4,})(?:;\S+)?\s*$/gm)].map(m => m[1]!))
+  return [...new Set(ids)]
 }
 
 /** Away: no message from the user to this session for `awayMinutes`, or none yet. */
