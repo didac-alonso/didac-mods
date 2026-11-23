@@ -5,10 +5,10 @@ import type { Engine } from 'claude-code/testing'
 import { alertDrop, lossChart } from './bridge'
 import type { PaceJob } from './bridge'
 import { chartSvg } from './chart'
-import { adoptedSuccessor, dropFrom, fmtDur, isAway, latestUserAt, nextPurge, opFrom, presenceWith, relayArmed, routeFor, successorAlive } from './drop'
+import { adoptedSuccessor, dropFrom, launchedIds, fmtDur, isAway, latestUserAt, nextPurge, opFrom, presenceWith, relayArmed, routeFor, successorAlive } from './drop'
 import type { Drop } from './drop'
 import { attachments, card, COLOR, curlConfig, parseCurl, payload, postArgv, progressBar, SILENT } from './embed'
-import { cardDrop, commonPrefix, refresh } from './jobcards'
+import { cardDrop, commonPrefix, FROZEN_MS, KEEP_MS, ORPHAN_MS, orphanState, refresh, TEXT_CHARS } from './jobcards'
 import type { JobCard } from './jobcards'
 
 const NOW = Date.parse('2026-10-15T15:00:00Z')
@@ -179,22 +179,30 @@ describe('pace-line alerts', () => {
 
 // ── Engine: the mod against a mocked Discord ──────────────────────────
 
-type World = { curl: { argv: string[]; stdin: string }[]; files: Record<string, string>; contexts: (readonly string[] | undefined)[]; asked: string[]; squeue: Record<string, string> }
+type World = {
+  curl: { argv: string[]; stdin: string }[]; files: Record<string, string>; contexts: (readonly string[] | undefined)[]; asked: string[]; squeue: Record<string, string>
+  /** While set, curl waits for it: a slow Discord. */
+  gate?: Promise<void>
+  /** Discord's answer to a curl, when not the usual 200. */
+  respond?: (argv: readonly string[]) => string | undefined
+}
 
-function world(on: On, env: Record<string, string> = {}): World {
+function world(on: On, env: Record<string, string> = {}, store?: Record<string, unknown>): World {
   const w: World = { curl: [], files: {}, contexts: [], asked: [], squeue: {} }
   const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
-  mock.store(on)
+  mock.store(on, store)
   mock.env(on, { HOME: '/home/demo', USER: 'demo', SLURMD_NODENAME: 'c0629', DISCORD_WEBHOOK_URL: SECRET, ...env })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'sess-1' }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('ui.toast', () => ({ value: undefined }))
-  on('process.run', (_$, e) => {
+  on('process.run', async (_$, e) => {
     const a = e.argv
     if (a[0] === 'curl') {
       w.curl.push({ argv: [...a], stdin: e.init?.stdin ?? '' })
-      return ok(`{"id":"m${w.curl.length}"}\n200`)
+      const id = `m${w.curl.length}`
+      if (w.gate) await w.gate
+      return ok(w.respond?.(a) ?? `{"id":"${id}"}\n200`)
     }
     if (a[0] === 'date') return ok('-0400\n')
     if (a[0] === 'squeue') return ok(w.squeue[a[a.indexOf('-j') + 1]!] ?? '')
@@ -660,3 +668,329 @@ test('a progress drop with "card" names and describes the card, before or after 
   expect(p.map(x => x.method)).toEqual(['POST', 'PATCH'])
   expect(JSON.stringify(p[1]!.body)).toContain('esperan cola')
 })
+
+// ── a job card's context: labels, the reminders, cards across sessions ──
+
+describe('job card context', () => {
+  const card = (rows: PaceJob[], over: Partial<JobCard> = {}): JobCard => ({ ...refresh([], rows, 'es', NOW, () => 'k')[0]!, ...over })
+
+  test('labels need a card, an object and at most 100; with a card they make a drop on their own', () => {
+    expect(drop({ card: '3001', kind: 'progress', labels: { '3001': '  escala   ×2 ' } }).labels).toEqual({ '3001': 'escala ×2' })
+    expect(dropFrom({ kind: 'done', title: 't', labels: { a: 'b' } })).toContain('labels go with "card"')
+    expect(dropFrom({ card: '3001', kind: 'progress', labels: ['x'] })).toContain('labels is an object')
+    expect(dropFrom({ card: '3001', kind: 'progress', labels: Object.fromEntries(Array.from({ length: 101 }, (_, i) => [`j${i}`, 'x'])) })).toContain('at most 100')
+    expect(drop({ kind: 'done', title: 't' }).labels).toBe(null)
+    // alone, without a kind, they are the card's progress op, never its (empty) results
+    expect(drop({ card: '3001', labels: { '3001': 'x' } }).kind).toBe('progress')
+    expect(dropFrom({ card: '3001', kind: 'result', title: 'F1', labels: { '3001': 'x' } })).toContain('labels go in the "kind": "progress" drop')
+  })
+
+  test('what an sbatch printed, as pace-line reads it', () => {
+    expect(launchedIds('sbatch train.sh', 'Submitted batch job 8001\n')).toEqual(['8001'])
+    expect(launchedIds('bash launch.sh', 'Submitted batch job 8001\nSubmitted batch job 8002\n')).toEqual(['8001', '8002'])
+    expect(launchedIds('sbatch --parsable train.sh', '8003\n')).toEqual(['8003'])
+    expect(launchedIds('grep Submitted slurm.log', 'Submitted batch job 7000\n')).toEqual([])
+    expect(launchedIds(": drop <<'EOF'\n{\"text\":\"sbatch\"}\nEOF", 'drop: sent')).toEqual([])
+  })
+
+  test('a long card drops lines from the end, counted, before Discord would cut it', () => {
+    const rows = Array.from({ length: 20 }, (_, i) => run(String(9000 + i), `job-${i}`, { metrics: null, progress: { k: 10, n: 2000 }, secPerIt: 2.5, logLoss: { key: `train_loss_${'w'.repeat(40)}`, value: 2.5 } }))
+    const labels = Object.fromEntries(rows.map(r => [r.id, `variante ${'x'.repeat(70)}`]))
+    const c = { ...refresh([], rows, 'es', NOW, () => 'k')[0]!, about: 'y'.repeat(1200), labels }
+    const d = cardDrop(c, 'es', NOW)
+    expect(d.text.length).toBeLessThanOrEqual(TEXT_CHARS)
+    expect(d.text).toMatch(/… y \d+ más/)
+    expect(cardDrop(c, 'es', NOW, 'adrift').text).toContain('Ninguna sesión sigue estos jobs')
+  })
+
+  test('a labelled line says what the job is; the others keep their name', () => {
+    const c = card([run('3001', 'p3t2a-tempo-scale05'), run('3002', 'p3t2a-tempo-scale1'), run('3003', 'p3t2a-tempo-scale2'), run('3004_7', 'arr')], {
+      labels: { '3001': 'escala ×0,5', 'p3t2a-tempo-scale1': 'escala ×1', '3004': 'semillas' },
+    })
+    const d = cardDrop(c, 'es', NOW)
+    expect(d.text).toContain('▶ **escala ×0,5** paso 100/400')
+    expect(d.text).toContain('▶ **escala ×1** paso')
+    expect(d.text).toContain('▶ **semillas · 7** paso')
+    expect(d.text).toContain('▶ `p3t2a-tempo-scale2` paso')
+  })
+
+  test('labels sent before the card existed land on it, and a description of 1200 characters fits', () => {
+    const about = `**Qué mide:** ${'x'.repeat(1100)}`
+    const notes = { '6001': { title: 'Grid', about, labels: { '6002': 'GDAG' }, at: NOW } }
+    const c = refresh([], [run('6001', 'p3t-a'), run('6002', 'p3t-b')], 'es', NOW, () => 'k', notes)[0]!
+    const d = cardDrop(c, 'es', NOW)
+    expect(d.text).toContain('**GDAG**')
+    expect(d.text).toContain(about)
+  })
+})
+
+describe('cards across sessions', () => {
+  test('a job another session took keeps its line up to date; another session\'s job opens no card here', () => {
+    let cards = refresh([], [run('3001', 'a')], 'es', NOW, () => 'k')
+    cards = refresh(cards, [run('3001', 'a', { owner: 'other', state: 'COMPLETED', endedAt: NOW })], 'es', NOW + MIN, () => 'k2')
+    expect(cards.map(c => c.rows.map(r => r.state))).toEqual([['ok']])
+    expect(refresh([], [run('4001', 'b', { owner: 'other' }), run('4002', 'c', { owner: 'none' })], 'es', NOW, () => 'k')).toEqual([])
+    // this session's job, on another session's live card: none here
+    expect(refresh([], [run('5001', 'd')], 'es', NOW, () => 'k', {}, new Set(['5001']))).toEqual([])
+  })
+
+  test('a card whose jobs still run outlives the three days', () => {
+    const c = refresh([], [run('3001', 'long')], 'es', NOW, () => 'k')
+    expect(refresh(c, [run('3001', 'long')], 'es', NOW + KEEP_MS + MIN, () => 'k2').map(x => x.key)).toEqual(['k'])
+  })
+
+  test('another session\'s card: adopted when its jobs are mine now, left while someone live has them, else an orphan', () => {
+    const c = { ...refresh([], [run('3001', 'a'), run('3002', 'b')], 'es', NOW, () => 'k')[0]!, tickAt: NOW - 20 * MIN }
+    expect(orphanState(c, [run('3001', 'a', { ownerAgent: 'r1' }), run('3002', 'b', { owner: 'none' })], NOW)).toEqual({ verdict: 'adopt', agent: 'r1' })
+    // one still runs for a live session: the card stays with it
+    expect(orphanState(c, [run('3001', 'a'), run('3002', 'b', { owner: 'other' })], NOW).verdict).toBe('alive')
+    expect(orphanState(c, [run('3001', 'a', { owner: 'other', state: 'COMPLETED', endedAt: NOW })], NOW).verdict).toBe('alive')
+    expect(orphanState(c, [run('3001', 'a', { owner: 'none' })], NOW).verdict).toBe('orphan')
+    expect(orphanState(c, [], NOW).verdict).toBe('orphan')
+    // its holder passed a minute ago
+    expect(orphanState({ ...c, tickAt: NOW - MIN }, [], NOW).verdict).toBe('alive')
+  })
+
+  test('a closed card says nobody follows it, without an ETA', () => {
+    const c = refresh([], [run('3001', 'a'), run('3002', 'b', { state: 'PENDING', metrics: null })], 'es', NOW, () => 'k')[0]!
+    const d = cardDrop(c, 'es', NOW, 'adrift')
+    expect(d.text).toContain('Ninguna sesión sigue estos jobs')
+    expect(d.text).toContain('`: jobs own 3001`')
+    expect(d.eta).toBe(null)
+    const ended = refresh([c], [run('3001', 'a', { state: 'COMPLETED', endedAt: NOW }), run('3002', 'b', { state: 'COMPLETED', endedAt: NOW })], 'es', NOW, () => 'k')[0]!
+    expect(cardDrop(ended, 'es', NOW, 'adrift').text).toContain('los resultados no llegarán aquí')
+    // pace-line lists none of them any more: gone, whatever the lines last said
+    expect(cardDrop(c, 'es', NOW, 'gone').text).toContain('los resultados no llegarán aquí')
+  })
+
+  test('a line pace-line stopped listing gives no ETA, so the card does not slide; a card nobody lists goes after three days', () => {
+    const c = refresh([], [run('3001', 'a')], 'es', NOW, () => 'k')
+    expect(cardDrop(c[0]!, 'es', NOW + MIN).eta).not.toBe(null)
+    expect(cardDrop(c[0]!, 'es', NOW + FROZEN_MS + MIN).eta).toBe(null)
+    expect(refresh(c, [], 'es', NOW + KEEP_MS + MIN, () => 'k2')).toEqual([])
+  })
+
+  test('a card on the previous version (no tickAt) is left, not adopted, for a day', () => {
+    const c = refresh([], [run('3001', 'a')], 'es', NOW, () => 'k')[0]!
+    const old = { ...c, tickAt: undefined, editedAt: NOW - 3600_000 }
+    expect(orphanState(old, [run('3001', 'a')], NOW).verdict).toBe('leave')
+    expect(orphanState({ ...old, editedAt: NOW - 2 * 86400_000, openedAt: NOW - 2 * 86400_000 }, [run('3001', 'a')], NOW).verdict).toBe('adopt')
+  })
+})
+
+const sbatchStub = (on: On, id = '8001') => on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: `Submitted batch job ${id}\n`, stderr: '', interrupted: false } }))
+
+test('the rules ask for a card\'s context and labels', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const w = world(on)
+  await begin($)
+  await say($)
+  const rules = w.contexts[0]!.find(c => c.includes('# Discord cards (discord-drop)'))!
+  expect(rules).toContain('what it is compared against')
+  expect(rules).toContain('"labels":{')
+  expect(rules).not.toContain('in a line or two')
+})
+
+test('an sbatch is reminded to give its card context, unless its jobs join a card that has it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  let jobs: PaceJob[] = []
+  paceState(on, () => jobs)
+  sbatchStub(on)
+  await begin($)
+  await say($)
+  const first = out(await $.tool.call({ tool: 'Bash', command: 'sbatch train.sh' }))
+  expect(first).toContain('job 8001 gets a Discord progress card')
+  expect(first).toContain('labels')
+  await dropCall($, { card: '8001', kind: 'progress', title: 'Grid 3T', text: '**Qué mide:** x' })
+  jobs = [run('8001', 'a')]
+  await clock.advance(16_000)
+  expect(out(await $.tool.call({ tool: 'Bash', command: 'sbatch eval.sh' }))).not.toContain('progress card within')
+})
+
+test('a card left without context is brought up once, at the next prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  paceState(on, () => [run('3001', 'sweep-a'), run('3002', 'sweep-b')])
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  await say($, 'task-notification')
+  expect(w.contexts.at(-1)?.some(c => c.includes('no context') && c.includes('3001'))).toBe(true)
+  await say($)
+  expect(w.contexts.at(-1)?.some(c => c.includes('no context')) ?? false).toBe(false)
+})
+
+const theirCard = (ids: string[], over: Partial<JobCard> = {}): JobCard => ({
+  ...refresh([], ids.map(id => run(id, `sweep-${id}`)), 'es', NOW - 30 * MIN, () => `jobs-old-${ids[0]}`)[0]!,
+  title: 'Grid 3T', about: '**Qué mide:** x', msgId: `m${ids[0]}`, shown: 'x', editedAt: NOW - 30 * MIN, tickAt: NOW - 30 * MIN, ...over,
+})
+
+test('a card whose jobs this session took is adopted: the same message is edited, and the results go into it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, {}, { 's:sess-0': {}, 'cards:sess-0': [theirCard(['3001', '3002'])] })
+  paceState(on, () => [run('3001', 'sweep-3001'), run('3002', 'sweep-3002', { state: 'COMPLETED', endedAt: NOW })])
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  const p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['PATCH'])
+  expect(p[0]!.stdin).toContain('/messages/m3001')
+  expect(JSON.stringify(p[0]!.body)).toContain('Grid 3T')
+  expect(out(await dropCall($, { card: '3001', kind: 'result', title: 'Grid 3T', text: 'F1 0.63' }))).toContain('replaced')
+  expect(w.curl.at(-1)!.argv).toContain('DELETE')
+  expect(w.curl.at(-1)!.stdin).toContain('/messages/m3001')
+})
+
+test('a card nobody follows any more is closed once, after ten minutes; one a live session has is left', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, {}, { 's:sess-0': {}, 'cards:sess-0': [theirCard(['3001', '3002']), theirCard(['3003'])] })
+  paceState(on, () => [run('3001', 'sweep-3001', { owner: 'none' }), run('3002', 'sweep-3002', { owner: 'none', state: 'COMPLETED', endedAt: NOW }), run('3003', 'sweep-3003', { owner: 'other' })])
+  await begin($)
+  await say($)
+  await clock.advance(5 * MIN)
+  expect(w.curl).toHaveLength(0)
+  await clock.advance(ORPHAN_MS)
+  const p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['PATCH'])
+  expect(p[0]!.stdin).toContain('/messages/m3001')
+  expect(JSON.stringify(p[0]!.body)).toContain('Ninguna sesión sigue estos jobs')
+  await clock.advance(30 * MIN)
+  expect(w.curl).toHaveLength(1)
+})
+
+test('a card another session adopted is left to it; one closed while this session was away is followed again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const moved = { ...theirCard(['3001']), key: 'jobs-moved' }
+  const base = { ...theirCard(['3002']), key: 'jobs-closed', editedAt: NOW, tickAt: NOW }
+  const d = cardDrop(refresh([base], [run('3002', 'sweep-3002')], 'es', NOW + 16_000, () => 'x')[0]!, 'es', NOW + 16_000)
+  const closed = { ...base, shown: JSON.stringify([d.title, d.text, Math.round(d.progress! * 100), d.eta === null ? null : Math.round(d.eta / 300)]) }
+  const w = world(on, {}, { 'cards:sess-1': [moved, closed], 'cardMoved:jobs-moved': { to: 'sess-2', at: NOW }, 'cardMoved:jobs-closed': { to: null, at: NOW } })
+  paceState(on, () => [run('3001', 'sweep-3001', { owner: 'other' }), run('3002', 'sweep-3002')])
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  const p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['PATCH'])
+  expect(p[0]!.stdin).toContain('/messages/m3002')
+  await clock.advance(5 * MIN)
+  expect(posted(w).every(x => !x.stdin.includes('/messages/m3001'))).toBe(true)
+})
+
+test('a card left in two lists is adopted once, from its freshest copy', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const stale = theirCard(['3001'], { title: 'old', tickAt: NOW - 3 * 3600_000 })
+  const fresh = theirCard(['3001'], { title: 'Grid 3T', tickAt: NOW - 20 * MIN })
+  const w = world(on, {}, { 's:sess-0': {}, 's:sess-2': {}, 'cards:sess-0': [stale], 'cards:sess-2': [fresh], [`cardMoved:${fresh.key}`]: { to: null, at: NOW - 10 * MIN } })
+  paceState(on, () => [run('3001', 'sweep-3001')])
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  await clock.advance(76_000)
+  const p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['PATCH'])
+  expect(JSON.stringify(p[0]!.body)).toContain('Grid 3T')
+})
+
+test('a card just given away is not taken back, nor opened again here, while pace-line\'s view here lags', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const mineCard = { ...theirCard(['3001']), key: 'jobs-given', tickAt: NOW }
+  const w = world(on, {}, { 's:sess-2': {}, 'cards:sess-1': [mineCard], 'cards:sess-2': [{ ...mineCard, tickAt: NOW }], 'cardMoved:jobs-given': { to: 'sess-2', at: NOW } })
+  // pace-line here still calls 3001 this session's
+  paceState(on, () => [run('3001', 'sweep-3001')])
+  await begin($)
+  await say($)
+  await clock.advance(2 * MIN)
+  expect(w.curl).toHaveLength(0)
+})
+
+test('start forgets other sessions\' cards nobody touched in two weeks, not a live one\'s', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const DAY = 86400_000
+  const ancient = theirCard(['3001'], { openedAt: NOW - 20 * DAY, lastAt: NOW - 20 * DAY, editedAt: NOW - 20 * DAY, tickAt: NOW - 20 * DAY })
+  // a session whose s: key was pruned but whose card is recent: kept, and adopted here
+  const recent = theirCard(['3002'])
+  const w = world(on, {}, { 'cards:sess-old': [ancient], 'cards:sess-x': [recent] })
+  paceState(on, () => [run('3001', 'sweep-3001'), run('3002', 'sweep-3002')])
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  const p = posted(w)
+  // 3002's card is edited in place; 3001's old one is forgotten, so 3001 gets a new card
+  expect(p.filter(x => x.method === 'PATCH').map(x => x.stdin.includes('/messages/m3002'))).toEqual([true])
+  expect(p.filter(x => x.method === 'POST')).toHaveLength(1)
+  expect(p.some(x => x.stdin.includes('/messages/m3001'))).toBe(false)
+})
+
+test('the sbatch reminder needs a real launch: a grep of a log gets none', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  world(on)
+  paceState(on, () => [])
+  sbatchStub(on, '7000')
+  await begin($)
+  await say($)
+  expect(out(await $.tool.call({ tool: 'Bash', command: 'grep Submitted slurm.log' }))).not.toContain('progress card within')
+  expect(out(await $.tool.call({ tool: 'Bash', command: 'sbatch --array=0-3 run.sh' }))).toContain('job 7000 gets')
+})
+
+test('a : drop naming the card answers at once while a pass waits on a slow Discord, and its title still lands', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  paceState(on, () => [run('3001', 'sweep-a')])
+  let open!: () => void
+  w.gate = new Promise(r => {
+    open = r
+  })
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  // the pass is waiting on its POST
+  expect(w.curl).toHaveLength(1)
+  expect(out(await dropCall($, { card: '3001', kind: 'progress', title: 'Grid 3T', text: '**Qué mide:** x' }))).toContain('keep updating')
+  w.gate = undefined
+  open()
+  await clock.advance(16_000)
+  await clock.advance(16_000)
+  const p = posted(w)
+  expect(p.map(x => x.method)).toEqual(['POST', 'PATCH'])
+  expect(JSON.stringify(p[1]!.body)).toContain('Grid 3T')
+})
+
+test('an edit of a message deleted in Discord stops for good; a webhook 404 is retried', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  let jobs = [run('3001', 'sweep-a')]
+  paceState(on, () => jobs)
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  const patches = () => posted(w).filter(x => x.method === 'PATCH').length
+  w.respond = a => (a.includes('PATCH') ? '{"message":"Unknown Webhook","code":10015}\n404' : undefined)
+  jobs = [run('3001', 'sweep-a', { elapsedS: 1200 })]
+  await clock.advance(76_000)
+  expect(patches()).toBeGreaterThanOrEqual(2)
+  w.respond = a => (a.includes('PATCH') ? '{"message":"Unknown Message","code":10008}\n404' : undefined)
+  jobs = [run('3001', 'sweep-a', { elapsedS: 1800 })]
+  await clock.advance(16_000)
+  const n = patches()
+  jobs = [run('3001', 'sweep-a', { state: 'COMPLETED', endedAt: NOW + 3 * MIN })]
+  await clock.advance(5 * MIN)
+  expect(patches()).toBe(n)
+  expect(posted(w).filter(x => x.method === 'POST')).toHaveLength(1)
+})
+
+test('another session\'s card for jobs already on a card here is not adopted as a second one: it is closed pointing to this one, once', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const mineCard = theirCard(['3001'], { key: 'jobs-mine', msgId: 'mmine', tickAt: NOW })
+  const w = world(on, {}, { 's:sess-0': {}, 'cards:sess-1': [mineCard], 'cards:sess-0': [theirCard(['3001'])] })
+  paceState(on, () => [run('3001', 'sweep-3001')])
+  await begin($)
+  await say($)
+  await clock.advance(16_000)
+  const theirs = () => posted(w).filter(x => x.stdin.includes('/messages/m3001'))
+  expect(theirs()).toHaveLength(1)
+  expect(JSON.stringify(theirs()[0]!.body)).toContain('siguen en otra tarjeta')
+  await clock.advance(ORPHAN_MS + 5 * MIN)
+  expect(theirs()).toHaveLength(1)
+})
+

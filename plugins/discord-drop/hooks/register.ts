@@ -3,11 +3,11 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 import { alertDrop, lossChart } from './bridge'
 import type { PaceJob, PaceJobs } from './bridge'
 import { chartSvg, ema, PALETTE } from './chart'
-import { adoptedSuccessor, cut, dropFrom, fmtDur, isAway, latestUserAt, MAX_FILE_BYTES, nextPurge, OP_LINE, opFrom, presenceWith, relayArmed, routeFor, successorAlive, TOOL } from './drop'
+import { adoptedSuccessor, cut, dropFrom, fmtDur, isAway, latestUserAt, launchedIds, MAX_FILE_BYTES, nextPurge, OP_LINE, opFrom, presenceWith, relayArmed, routeFor, successorAlive, TOOL } from './drop'
 import type { Drop, Field, Kind, Route } from './drop'
 import { attachments, baseOf, card, curlConfig, deleteArgv, failure, messageUrl, parseCurl, patchArgv, payload, postArgv, postUrl, STRINGS, tookField } from './embed'
-import { cardDrop, cardOf, EDIT_MS, refresh } from './jobcards'
-import type { CardNote, JobCard } from './jobcards'
+import { BURST_MS, cardDrop, cardOf, cardTitle, EDIT_MS, labelOf, ORPHAN_MS, orphanState, refresh, updateRows, wouldCard } from './jobcards'
+import type { CardNote, JobCard, Moved } from './jobcards'
 import type { Lang, Strings } from './embed'
 
 type Raw = Record<string, unknown>
@@ -25,6 +25,10 @@ const KEEP_SESSIONS = 30
 // another plugin's message (a pace-line alert already has its card)
 const NET_ORIGINS = new Set(['composer', 'bridge', 'task-notification', 'auto-continuation'])
 
+/** What a job card's context says: the rules, the reminder after sbatch and the one at the next prompt share it. */
+const CONTEXT_ASK = 'the question the batch answers, what it is compared against (the baseline or earlier result, with its number), how to read the lines, and what result would decide what; a short paragraph or a few bold-led lines, not a list or a count of the runs. labels maps each job id (or job name) to what that job is ("scale ×2 · captions"), so each line names its variant instead of the raw job name'
+const NAME_OP = '{"kind":"progress","card":"<one of its job ids>","title":…,"text":…,"labels":{…}}'
+
 const rules = (awayMinutes: number) => `# Discord cards (discord-drop)
 The user reads Discord on their phone. A card reaches them only when they're away (no message from them to this session for ${awayMinutes} min) or when they asked for one; while they're working with you nothing is sent. Send a card with ${TOOL}; it runs nothing and needs no permission. The mod answers "sent", "progress updated", or "held" (they're here: don't mention it).
 - Starting something that will take a while (a download, a long change, a training or eval run, a batch of figures): say once, in the user's language, that if they're away when it finishes you'll message them on Discord.
@@ -32,11 +36,19 @@ The user reads Discord on their phone. A card reaches them only when they're awa
 - Long work you can follow: kind "progress" with a key, progress 0-1 and eta (unix seconds); the same key edits the same card without a sound; final:true closes it and announces the end.
 - "force": true only when the user asked to be messaged.
 - pace-line's batch-job alerts already reach Discord through this mod: drop about a job only to add something (a diagnosis and a fix).
-- Batch jobs this session (or a subagent of it) launches get a progress card by themselves, one per launch: counts, a line per job, the total ETA, edited as they run. Don't make another. Right after launching a batch, name it and say in a line or two what it is, in the user's language: kind "progress", "card": "<one of its job ids>", a title ("Grid 3T (tempo users)") and a text ("210 runs: 3 variants × 14 subjects × 5 seeds"). When the results the user asked for are ready (their table, comparison or numbers, not a generic summary), send them into it: a result drop with "card". They replace the progress card, silently while the user is here, with a notification when they're away.
+- Batch jobs this session (or a subagent of it) launches get a progress card by themselves, one per launch: counts, a line per job, the total ETA, edited as they run. Don't make another. Right after launching, give it its context, in the user's language: one drop with kind "progress", "card": "<one of its job ids>", a title that says what the batch is, a text and labels. The text is for someone reading on a phone without the project in their head: ${CONTEXT_ASK}. Send it again when the plan changes. When the results the user asked for are ready (their table, comparison or numbers, not a generic summary), send them into it: a result drop with "card". They replace the progress card, silently while the user is here, with a notification when they're away.
 - Never write the webhook URL in a command. The discord-drop skill has card templates (eval, paper figures, sweeps, datasets, reproducibility).
 : drop <<'EOF'
 {"kind":"result","title":"Eval COCO val2017","text":"mAP 43.0, +1.8 over the baseline","fields":[{"name":"mAP","value":"43.0"},{"name":"baseline","value":"41.2"},{"name":"Δ","value":"+1.8"}],"image":"/abs/path/pr_curve.png"}
+EOF
+A job card's context, right after sbatch:
+: drop <<'EOF'
+{"kind":"progress","card":"11823960","title":"3T.2 batch B: captions and scale strength","text":"**What it measures:** whether text users add anything on top of tempo+GDAG+scale (F1@50 0.61, level with the Oracle).\n**How to read it:** one line per scale strength, each against tempo_gdag_scale; 14 subjects × 5 seeds each.\n**Decides:** if none beats 0.61, captions stay out of the final table.","labels":{"11823960":"scale ×0.5","11823961":"scale ×1","11823962":"scale ×2"}}
 EOF`
+
+/** After an sbatch whose jobs open a card without context: give it one now. */
+const launchHint = (ids: string[]) =>
+  `discord-drop: job${ids.length === 1 ? '' : 's'} ${ids.slice(0, 6).join(', ')}${ids.length > 6 ? '…' : ''} get${ids.length === 1 ? 's' : ''} a Discord progress card within a minute, which the user reads on their phone. Give it its context now, in their language, with one drop: ${NAME_OP} with ${CONTEXT_ASK}. Skip it only for a throwaway test job.`
 
 const handoffPrompt = (left: string, job: string | null) =>
   `[discord-drop: this allocation${job ? ` (Slurm job ${job})` : ''} ends in ${left} and the user is away; not typed by the user]
@@ -44,7 +56,7 @@ Send one \`: drop\` now with kind "urgent" and "force": true: what you were doin
 
 /** A Drop of the mod's own: every field not given left empty. */
 const own = (d: Partial<Drop> & Pick<Drop, 'kind' | 'title'>): Drop => ({
-  text: '', fields: [], image: null, files: [], url: null, key: null, progress: null, eta: null, final: false, force: false, card: null, author: null, footer: null, ...d,
+  text: '', fields: [], image: null, files: [], url: null, key: null, progress: null, eta: null, final: false, force: false, card: null, labels: null, author: null, footer: null, ...d,
 })
 
 /** What a waiting tool call is about, for the card. */
@@ -347,7 +359,7 @@ async function bridge($: EngineInterface): Promise<void> {
   for (const a of fresh) {
     const job = jobs.jobs.find(j => j.id === a.job)
     // its progress card already says it started, waited or finished well
-    if (ROUTINE.has(a.kind) && a.level === 'info' && cardOf(cards, a.job)) continue
+    if (ROUTINE.has(a.kind) && a.level === 'info' && cardOf(cards.filter(c => !c.goneAt), a.job)) continue
     // the job reported itself through jobkit.notify()
     if (a.kind === 'ended' && job?.workDir && (await exists($, `${job.workDir}/runs/${job.jobId}/notified.json`))) continue
     const image = a.kind === 'ended' && job ? await renderChart($, job) : null
@@ -363,7 +375,27 @@ async function bridge($: EngineInterface): Promise<void> {
 const ROUTINE = new Set(['started', 'ended', 'pending', 'resumed'])
 const cardsKey = () => `cards:${env.sessionId}`
 const notesKey = () => `cardNotes:${env.sessionId}`
+/** Which session holds a card now (or null: closed as an orphan): written by the one that adopts or closes it. */
+const movedKey = (card: string) => `cardMoved:${card}`
 let cardSeq = 0
+/** Other sessions' cards are looked at this often, and at once when one of this session's jobs is on no card here. */
+const SWEEP_MS = 60_000
+let lastSweep = 0
+/** Jobs on another session's live card at the last look: they open no card here. */
+let elsewhere = new Set<string>()
+/** Other sessions' cards that look orphaned, since when (closed after ORPHAN_MS). */
+let suspects = new Map<string, number>()
+/**
+ * Cards another session adopted from this one lately, with their jobs: for a
+ * poll or two pace-line's view here still calls those jobs this session's, so
+ * they open no card here and the card is not taken back meanwhile.
+ */
+const givenAway = new Map<string, { until: number; jobs: string[] }>()
+const GIVEN_AWAY_MS = 3 * 60_000
+/** A session's card list (and its notes) nobody touched in this long is forgotten. */
+const FORGET_CARDS_MS = 14 * 86400_000
+/** Cards Claude was reminded to give context to. */
+const nudged = new Set<string>()
 
 async function loadCards($: EngineInterface): Promise<JobCard[]> {
   return ((await $.store.get(cardsKey())) as JobCard[] | undefined) ?? []
@@ -381,63 +413,281 @@ async function remove($: EngineInterface, id: string): Promise<Sent> {
  * silently when they show up, edited (silently) as they run, at most once a
  * minute, at once when one ends.
  */
-async function jobCards($: EngineInterface): Promise<void> {
+/** An edit of a message that was deleted in Discord (not a webhook that is gone: that comes back once fixed). */
+const isGone = (r: Sent) => !r.ok && /Unknown Message/i.test(r.message)
+
+/**
+ * This session's card list is read, changed and written by one thing at a
+ * time: a pass's planning or its write-back, or a card op of Claude's. No
+ * Discord call is made under it, so a slow Discord holds up nobody's `: drop`.
+ */
+let cardLock: Promise<unknown> = Promise.resolve()
+function locked<T>(fn: () => Promise<T>): Promise<T> {
+  const run = cardLock.then(fn, fn)
+  cardLock = run.catch(() => undefined)
+  return run
+}
+let pass: Promise<void> | null = null
+
+/** A pass over the cards. Passes run one after another: one still running is joined, or with `fresh` (it read pace-line before an alert) followed by a new one. */
+function jobCards($: EngineInterface, fresh = false): Promise<void> {
+  if (pass && !fresh) return pass
+  const run = (pass ?? Promise.resolve()).catch(() => undefined).then(() => cardsPass($))
+  const tracked: Promise<void> = run.finally(() => {
+    if (pass === tracked) pass = null
+  })
+  pass = tracked
+  return tracked
+}
+
+type Outcome = { msgId?: string; shown?: string; editedAt?: number; endedShown?: number; goneAt?: number }
+
+async function cardsPass($: EngineInterface): Promise<void> {
   if (!cfg.jobCards) return
   const jobs = await paceJobs($)
-  const mine = (jobs?.jobs ?? []).filter(j => j.owner === 'mine')
-  const saved = await loadCards($)
-  if (!mine.length && !saved.length) return
+  const all = jobs?.jobs ?? []
+  const mine = all.filter(j => j.owner === 'mine')
   if (!(await webhook($))) return
   const now = await $.clock.now()
-  const notes = ((await $.store.get(notesKey())) as Record<string, CardNote> | undefined) ?? {}
-  const cards = refresh(saved, mine, cfg.lang, now, () => `jobs-${env.sessionId.slice(0, 8)}-${now.toString(36)}-${cardSeq++}`, notes)
-  for (const c of cards) {
-    if (c.reportedAt !== null) continue
+  for (const [k, g] of givenAway) if (g.until <= now) givenAway.delete(k)
+  // other sessions' lists and the move markers: this session's own list is only read here
+  const moves = await settleMoves($, await loadCards($), now)
+  const away = new Set([...givenAway.values()].flatMap(g => g.jobs))
+  const unseen = mine.some(j => wouldCard(j, now) && !elsewhere.has(j.id) && !away.has(j.id) && !moves.keep.some(c => c.rows.some(r => r.id === j.id)))
+  let adopted: JobCard[] = []
+  // adopting or closing other sessions' cards needs pace-line's view of whose the jobs are now
+  if (jobs && (unseen || now - lastSweep >= SWEEP_MS)) {
+    lastSweep = now
+    adopted = await sweep($, all, moves.keep, now)
+  }
+  // the plan: this session's list as it is now (Claude may have changed it meanwhile), brought up to date
+  const plan = await locked(async () => {
+    const current = (await loadCards($)).filter(c => !moves.dropped.has(c.key))
+    for (const c of current) if (moves.resumed.has(c.key)) Object.assign(c, { shown: null, editedAt: 0 })
+    for (const a of adopted) if (!current.some(c => c.key === a.key)) current.push(a)
+    if (!mine.length && !current.length) {
+      if (moves.dropped.size) await $.store.set(cardsKey(), current)
+      return []
+    }
+    const notes = ((await $.store.get(notesKey())) as Record<string, CardNote> | undefined) ?? {}
+    const cards = refresh(current, all, cfg.lang, now, () => `jobs-${env.sessionId.slice(0, 8)}-${now.toString(36)}-${cardSeq++}`, notes, new Set([...elsewhere, ...away]))
+    await $.store.set(cardsKey(), cards)
+    // notes are kept a day, for a card that shows up late
+    const freshNotes = Object.fromEntries(Object.entries(notes).filter(([, n]) => now - n.at < 86400_000))
+    if (Object.keys(freshNotes).length !== Object.keys(notes).length) await $.store.set(notesKey(), freshNotes)
+    return cards
+  })
+  // Discord, outside the lock
+  const outcomes = new Map<string, Outcome & { rev: number }>()
+  for (const c of plan) {
+    if (c.reportedAt !== null || c.goneAt) continue
     const d = cardDrop(c, cfg.lang, now)
     // the ETA in 5-minute steps: Discord draws its countdown
     const shown = JSON.stringify([d.title, d.text, d.progress === null ? null : Math.round(d.progress * 100), d.eta === null ? null : Math.round(d.eta / 300)])
     const ended = c.rows.filter(r => r.state === 'ok' || r.state === 'failed').length
+    const rev = c.rev ?? 0
     if (!c.msgId) {
       const r = await post($, d, true)
-      if (r.ok && r.id) Object.assign(c, { msgId: r.id, shown, editedAt: now, endedShown: ended })
+      if (r.ok && r.id) outcomes.set(c.key, { msgId: r.id, shown, editedAt: now, endedShown: ended, rev })
     } else if (shown !== c.shown && (now - c.editedAt >= EDIT_MS || ended !== c.endedShown)) {
       const r = await edit($, c.msgId, d)
-      if (r.ok) Object.assign(c, { shown, editedAt: now, endedShown: ended })
+      if (r.ok) outcomes.set(c.key, { shown, editedAt: now, endedShown: ended, rev })
+      // deleted in Discord: nothing left to edit, and its jobs open no new card
+      else if (isGone(r)) outcomes.set(c.key, { goneAt: now, rev })
     }
   }
-  await $.store.set(cardsKey(), cards)
-  // notes are kept a day, for a card that shows up late
-  const fresh = Object.fromEntries(Object.entries(notes).filter(([, n]) => now - n.at < 86400_000))
-  if (Object.keys(fresh).length !== Object.keys(notes).length) await $.store.set(notesKey(), fresh)
+  if (!outcomes.size) return
+  // what Discord said, written onto the list as it is now
+  const strays: string[] = []
+  await locked(async () => {
+    const current = await loadCards($)
+    for (const c of current) {
+      const o = outcomes.get(c.key)
+      if (!o) continue
+      // its results came meanwhile: a progress message just posted for it goes
+      if (c.reportedAt !== null) {
+        if (o.msgId) strays.push(o.msgId)
+        continue
+      }
+      const { rev, ...got } = o
+      // Claude renamed it meanwhile: keep it due for an edit with the new text
+      Object.assign(c, (c.rev ?? 0) === rev ? got : { ...got, shown: null, editedAt: 0 })
+    }
+    await $.store.set(cardsKey(), current)
+  })
+  for (const id of strays) await remove($, id)
 }
 
-/** Results with "card": they replace that job's progress card (a new message, so it can notify). Null when no card holds the job. */
-async function intoCard($: EngineInterface, drop: Drop, away: boolean, now: number): Promise<string | null> {
-  const cards = await loadCards($)
-  const c = cardOf(cards, drop.card!)
-  // kind "progress": a name and a description for the card, which keeps updating by itself
-  if (drop.kind === 'progress') {
-    const note: CardNote = { title: drop.title || null, about: drop.text || null, at: now }
-    if (c && c.reportedAt === null) {
-      Object.assign(c, { title: note.title ?? c.title, about: note.about ?? c.about, shown: null, editedAt: 0 })
-      await $.store.set(cardsKey(), cards)
-      return "drop: the jobs' progress card now has this title and description; its counts, lines and ETA keep updating by themselves"
+/**
+ * This session's cards, less those another session adopted since (its jobs
+ * moved there: `dropped`, taken off this session's list at the next write).
+ * One closed as an orphan while this session was away is followed again from
+ * here (`resumed`: its next edit drops the closing line).
+ */
+async function settleMoves($: EngineInterface, saved: JobCard[], now: number): Promise<{ keep: JobCard[]; dropped: Set<string>; resumed: Set<string> }> {
+  const keep: JobCard[] = []
+  const dropped = new Set<string>()
+  const resumed = new Set<string>()
+  for (const c of saved) {
+    if (c.reportedAt === null && c.msgId && !c.goneAt) {
+      const moved = (await $.store.get(movedKey(c.key))) as Moved | undefined
+      if (moved?.to && moved.to !== env.sessionId) {
+        givenAway.set(c.key, { until: now + GIVEN_AWAY_MS, jobs: c.rows.map(r => r.id) })
+        dropped.add(c.key)
+        continue
+      }
+      if (moved && moved.to === null) {
+        await $.store.set(movedKey(c.key), { to: env.sessionId, at: now } satisfies Moved)
+        resumed.add(c.key)
+      }
     }
-    const notes = ((await $.store.get(notesKey())) as Record<string, CardNote> | undefined) ?? {}
-    notes[drop.card!] = note
-    await $.store.set(notesKey(), notes)
-    return "drop: noted; the jobs' progress card gets this title and description when it appears (pace-line lists the job within a minute)"
+    keep.push(c)
   }
-  if (!c) return null
+  return { keep, dropped, resumed }
+}
+
+/**
+ * Other sessions' open cards. A card can sit in more than one list (a session
+ * gone before it saw its card adopted): it is the copy its marker names, else
+ * the freshest. One whose jobs are this session's now is adopted (returned, to
+ * be added to this session's list), unless they are on a card here already;
+ * one nobody follows any more (its holder gone, its jobs nobody's) is closed
+ * after ORPHAN_MS with a last edit that says so. Sets `elsewhere`: the jobs on
+ * cards a live session holds.
+ */
+async function sweep($: EngineInterface, jobs: readonly PaceJob[], saved: readonly JobCard[], now: number): Promise<JobCard[]> {
+  const held = new Set(saved.map(c => c.key))
+  const here = new Set(saved.filter(c => c.reportedAt === null && !c.goneAt).flatMap(c => c.rows.map(r => r.id)))
+  const holders = new Set<string>()
+  const copies = new Map<string, { holder: string; card: JobCard }[]>()
+  for (const k of (await $.store.keys()).filter(k => k.startsWith('cards:') && k !== cardsKey())) {
+    const holder = k.slice('cards:'.length)
+    holders.add(holder)
+    for (const c of ((await $.store.get(k)) as JobCard[] | undefined) ?? []) {
+      if (c.reportedAt !== null || !c.msgId || c.goneAt || held.has(c.key) || givenAway.has(c.key)) continue
+      copies.set(c.key, [...(copies.get(c.key) ?? []), { holder, card: c }])
+    }
+  }
+  const adopted: JobCard[] = []
+  const live = new Set<string>()
+  const suspect = new Map<string, number>()
+  const freshness = (c: JobCard) => c.tickAt ?? c.editedAt ?? 0
+  for (const [key, list] of copies) {
+    const moved = (await $.store.get(movedKey(key))) as Moved | undefined
+    // marked as this session's but not on its list: it was let go here
+    if (moved?.to === env.sessionId) continue
+    // the copy its marker names; else (never moved, closed, or its holder's list is gone) the freshest
+    const at = moved?.to && holders.has(moved.to) ? list.find(x => x.holder === moved.to) : [...list].sort((x, y) => freshness(y.card) - freshness(x.card))[0]
+    if (!at) continue
+    const c = at.card
+    const o = orphanState(c, jobs, now)
+    // every job on it is on a card here already: it is closed pointing there, and marked this session's so its holder lets it go
+    if (o.verdict === 'adopt' && c.rows.every(r => here.has(r.id))) {
+      const r = await edit($, c.msgId!, cardDrop(updateRows(c, jobs, cfg.lang, now), cfg.lang, now, 'moved'))
+      if (r.ok || isGone(r)) await $.store.set(movedKey(key), { to: env.sessionId, at: now } satisfies Moved)
+      continue
+    }
+    if (o.verdict === 'adopt') {
+      adopted.push({ ...c, labels: c.labels ?? {}, agent: o.agent, shown: null, editedAt: 0, tickAt: now, adoptedAt: now })
+      // Claude here didn't launch them: no reminder for its context
+      nudged.add(key)
+      await $.store.set(movedKey(key), { to: env.sessionId, at: now } satisfies Moved)
+      continue
+    }
+    if (o.verdict === 'leave') continue
+    if (o.verdict === 'alive') {
+      for (const r of c.rows) live.add(r.id)
+      continue
+    }
+    if (moved && moved.to === null) continue
+    const since = suspects.get(key) ?? now
+    suspect.set(key, since)
+    if (now - since < ORPHAN_MS) continue
+    const listed = c.rows.some(r => jobs.some(j => j.id === r.id))
+    const r = await edit($, c.msgId!, cardDrop(updateRows(c, jobs, cfg.lang, now), cfg.lang, now, listed ? 'adrift' : 'gone'))
+    if (r.ok || isGone(r)) {
+      await $.store.set(movedKey(key), { to: null, at: now } satisfies Moved)
+      suspect.delete(key)
+    }
+  }
+  suspects = suspect
+  elsewhere = live
+  return adopted
+}
+
+/** This session's cards still without context, once each: a reminder for Claude's next prompt. */
+async function contextHint($: EngineInterface): Promise<string | null> {
+  if (!cfg.jobCards) return null
+  const bare = (await loadCards($)).filter(c =>
+    c.reportedAt === null && c.msgId && !c.goneAt && !c.title && !c.about && !nudged.has(c.key) && c.rows.some(r => r.state === 'running' || r.state === 'queued'))
+  if (!bare.length) return null
+  for (const c of bare) nudged.add(c.key)
+  const which = bare.map(c => {
+    const ids = c.rows.map(r => r.id)
+    return `"${cardTitle(c, cfg.lang)}" (job${ids.length === 1 ? '' : 's'} ${ids.slice(0, 4).join(', ')}${ids.length > 4 ? '…' : ''}${c.agent ? ', launched by a subagent: you know its brief' : ''})`
+  })
+  return `discord-drop: ${bare.length === 1 ? 'a Discord progress card still has' : 'these Discord progress cards still have'} no context, only the list of jobs: ${which.join('; ')}. The user reads it on their phone. Give it one drop now, in their language: ${NAME_OP} with ${CONTEXT_ASK}. Skip it only for a throwaway test job.`
+}
+
+/** After a Bash call that submitted jobs (as pace-line reads it): unless they join a card Claude already described, ask for its context. */
+async function launchNote($: EngineInterface, agentId: string | undefined, command: string, r: Raw): Promise<Raw> {
+  if (!cfg.jobCards || r.deny !== undefined || r.isError === true) return r
+  const out = (r.result as { stdout?: unknown } | undefined)?.stdout
+  const ids = launchedIds(command, typeof out === 'string' ? out : typeof r.text === 'string' ? r.text : '')
+  // no card comes without a webhook, or without pace-line to list the jobs
+  if (!ids.length || !(await webhook($)) || !(await paceJobs($))) return r
+  const now = await $.clock.now()
+  const agent = agentId ?? null
+  const open = (await loadCards($)).filter(c => c.reportedAt === null && c.agent === agent && (agent !== null || now - c.lastAt <= BURST_MS))
+  const joins = open.at(-1)
+  if (joins && (joins.title || joins.about)) return r
+  const ctx = Array.isArray(r.context) ? (r.context as string[]) : []
+  return { ...r, context: [...ctx, launchHint(ids)] }
+}
+
+/**
+ * A drop with "card". Kind "progress" names and explains the card, which keeps
+ * updating by itself. Any other kind is its results: they replace it (a new
+ * message, so it can notify). Null when no card holds the job.
+ */
+async function intoCard($: EngineInterface, drop: Drop, away: boolean, now: number): Promise<string | null> {
+  if (drop.kind === 'progress') return locked(() => nameCard($, drop, now))
+  if (!cardOf(await loadCards($), drop.card!)) return null
+  // the results go out first, outside the lock; then the card is marked and its message removed
   const isSilent = !(away || drop.force)
-  const r = await post($, { ...drop, key: null, progress: null, eta: null, final: false, card: null }, isSilent)
+  const r = await post($, { ...drop, key: null, progress: null, eta: null, final: false, card: null, labels: null }, isSilent)
   if (!r.ok) return r.message
-  if (c.msgId) await remove($, c.msgId)
-  Object.assign(c, { reportedAt: now, msgId: null })
-  await $.store.set(cardsKey(), cards)
+  const old = await locked(async () => {
+    const cards = await loadCards($)
+    const c = cardOf(cards, drop.card!)
+    if (!c) return null
+    const id = c.msgId
+    Object.assign(c, { reportedAt: now, msgId: null })
+    await $.store.set(cardsKey(), cards)
+    return id
+  })
+  if (old) await remove($, old)
   st.lastSentAt = now
   await persist($)
   return isSilent ? "drop: the results replaced the jobs' progress card (silent: the user is here)" : "drop: the results replaced the jobs' progress card, with a notification"
+}
+
+/** A title, a description and labels for the card, or a note for it when it doesn't exist yet. Under the lock. */
+async function nameCard($: EngineInterface, drop: Drop, now: number): Promise<string> {
+  const cards = await loadCards($)
+  const c = cardOf(cards, drop.card!)
+  const note: CardNote = { title: drop.title || null, about: drop.text || null, labels: drop.labels, at: now }
+  if (c && c.reportedAt === null && !c.goneAt) {
+    Object.assign(c, { title: note.title ?? c.title, about: note.about ?? c.about, labels: { ...(c.labels ?? {}), ...(drop.labels ?? {}) }, shown: null, editedAt: 0, rev: (c.rev ?? 0) + 1 })
+    await $.store.set(cardsKey(), cards)
+    const unlabelled = drop.labels ? c.rows.filter(r => !labelOf(c, r)).length : 0
+    const got = [note.title || note.about ? 'this title and description' : '', drop.labels ? `${Object.keys(drop.labels).length} labels` : ''].filter(Boolean).join(' and ')
+    return `drop: the jobs' progress card now has ${got}; its counts, lines and ETA keep updating by themselves${unlabelled ? ` (${unlabelled} of its lines have no label yet)` : ''}`
+  }
+  const notes = ((await $.store.get(notesKey())) as Record<string, CardNote> | undefined) ?? {}
+  notes[drop.card!] = note
+  await $.store.set(notesKey(), notes)
+  return "drop: noted; the jobs' progress card gets this title and description when it appears (pace-line lists the job within a minute)"
 }
 
 /**
@@ -445,7 +695,20 @@ async function intoCard($: EngineInterface, drop: Drop, away: boolean, now: numb
  * (its `: drop` reaches no hook): ~/.claude/discord-drop/outbox/<agent>-<n>.json.
  * Sent as a drop, then deleted. Other sessions' files are left to them.
  */
+let outboxBusy = false
+
+/** One run at a time: two would both read a file before either removes it, and send it twice. */
 async function outbox($: EngineInterface): Promise<void> {
+  if (outboxBusy) return
+  outboxBusy = true
+  try {
+    await outboxNow($)
+  } finally {
+    outboxBusy = false
+  }
+}
+
+async function outboxNow($: EngineInterface): Promise<void> {
   if (!env.dir) return
   const dir = `${env.dir}/outbox`
   let names: string[]
@@ -627,8 +890,28 @@ async function start($: EngineInterface, cwd: string): Promise<void> {
   // alerts raised before this load were pace-line's to tell, not ours to repeat
   st.bridgeAfter = typeof saved?.bridgeAfter === 'number' ? saved.bridgeAfter : now
   await persist($)
-  const old = (await $.store.keys()).filter(k => k.startsWith('s:') && k !== sessionKey())
+  const keys = await $.store.keys()
+  const old = keys.filter(k => k.startsWith('s:') && k !== sessionKey())
   for (const k of old.slice(0, Math.max(0, old.length - (KEEP_SESSIONS - 1)))) await $.store.delete(k)
+  // another session's cards and notes go after two weeks nobody touched them; a move marker once no list has its card
+  const holding = new Set<string>()
+  for (const k of keys.filter(k => k.startsWith('cards:'))) {
+    const list = ((await $.store.get(k)) as JobCard[] | undefined) ?? []
+    const last = Math.max(0, ...list.map(c => Math.max(c.tickAt ?? 0, c.editedAt, c.lastAt, c.openedAt, c.reportedAt ?? 0)))
+    if (k !== cardsKey() && now - last > FORGET_CARDS_MS) {
+      await $.store.delete(k)
+      continue
+    }
+    for (const c of list) holding.add(c.key)
+  }
+  const left = new Set(await $.store.keys())
+  for (const k of left) {
+    if (k.startsWith('cardMoved:') && !holding.has(k.slice('cardMoved:'.length))) await $.store.delete(k)
+    if (k.startsWith('cardNotes:') && k !== notesKey() && !left.has(`cards:${k.slice('cardNotes:'.length)}`)) {
+      const notes = Object.values(((await $.store.get(k)) as Record<string, CardNote> | undefined) ?? {})
+      if (notes.every(n => now - n.at > 86400_000)) await $.store.delete(k)
+    }
+  }
 
   if (!env.dir) return
   try {
@@ -657,7 +940,10 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     await start($, e.cwd)
     $.clock.every(15_000, () => void bridge($).catch(() => undefined))
-    $.clock.every(15_000, () => void jobCards($).then(() => outbox($)).catch(() => undefined))
+    // a tick while a pass still runs is skipped: the pass is not joined by every tick of a slow Discord
+    $.clock.every(15_000, () => {
+      if (!pass) void jobCards($).then(() => outbox($)).catch(() => undefined)
+    })
     $.clock.every(60_000, () => void watchEnd($).catch(() => undefined))
     $.clock.every(6 * 3600_000, () => void checkPurge($).catch(() => undefined))
     void checkPurge($).catch(() => undefined)
@@ -671,13 +957,16 @@ export const register: Register = (on, options) => {
     const kind = e.origin.kind
     turnOrigin = kind
     if (kind === 'composer' || kind === 'bridge') await heard($)
+    // a card that opened without context: Claude is asked once, at the next prompt of any kind
+    const bare = (e as { command?: unknown }).command || e.text.startsWith('[discord-drop:') ? null : await contextHint($).catch(() => null)
+    if (bare) e = { ...e, context: [...(e.context ?? []), bare] }
     // a pace-line alert about jobs with a progress card: where their results go
     if (kind === 'plugin' && cfg.jobCards && e.text.startsWith('[pace-line:')) {
       // the alert can come before the card's next refresh: bring it up to date first
-      await jobCards($).catch(() => undefined)
+      await jobCards($, true).catch(() => undefined)
       const cards = await loadCards($)
       const ids = [...new Set([...e.text.matchAll(/\((\d+(?:_\S+?)?)\)/g)].map(m => m[1]!))]
-      const open = ids.map(id => [id, cardOf(cards, id)] as const).filter(([, c]) => c && c.reportedAt === null)
+      const open = ids.map(id => [id, cardOf(cards, id)] as const).filter(([, c]) => c && c.reportedAt === null && !c.goneAt)
       if (open.length) {
         const [id, c] = open[0]!
         const left = c!.rows.filter(r => r.state === 'queued' || r.state === 'running').length
@@ -716,7 +1005,8 @@ export const register: Register = (on, options) => {
       }
     }
     try {
-      return await next(e)
+      const r = await next(e)
+      return e.tool === 'Bash' && typeof input.command === 'string' ? ((await launchNote($, e.agentId, input.command, r as unknown as Raw).catch(() => r as unknown as Raw)) as unknown as typeof r) : r
     } finally {
       // a permission prompt for this call was answered
       disarm(e.tool)

@@ -23,6 +23,7 @@ EOF
 | `files` | absolute paths attached below; ≤ 10 with the image, ≤ 10 MB each |
 | `url` | makes the title a link: the PR, the run, the paper |
 | `key`, `progress`, `eta`, `final` | progress cards: same key edits the same card silently; `progress` 0–1; `eta` unix seconds (shown as "in 2 hours"); `final: true` closes it and announces the end |
+| `card`, `labels` | a job id: with kind `progress`, the title and text name and explain that job's progress card (it updates by itself); with any other kind, the results replace it. `labels` (with `card`) maps job ids or names to what each job is, shown on its line |
 | `force` | only when the user asked to be messaged |
 | `author`, `footer` | override the header (`Claude · <project>`) and the small print |
 
@@ -49,6 +50,8 @@ Write in the user's language. The first line answers "what happened?"; one phone
 **Paper figures.** Render at final size (one column ≈ 3.3 in, two ≈ 6.9 in; 300 dpi; the paper's fonts). The PNG preview as `image`; the PDF and a `.tex` snippet in `files` (the `figure` or `table` environment ready to paste; in tables `\textbf{}` the best, `\underline{}` the second). Say what changed since the last version.
 
 **Data sanity check.** Before an expensive launch: a grid of 16 samples after augmentation with labels drawn, the batch's class histogram, input sizes and value ranges. `kind: "needs-you"` when you're waiting for the go-ahead, and don't launch until they answer in the terminal.
+
+**A batch's progress card.** Right after sbatch, one `progress` drop with `card`: the title says what the batch is (`3T.2 · tanda B: captions y escala`), the text gives the context someone needs on a phone without the project in their head, in three or four bold-led lines: **Qué mide** (the question, and why now), **Contra qué** (the baseline or earlier result, with its number), **Cómo leerlo** (what the lines are, what to look at), **Decide** (what result changes what). `labels` turn each line's raw job name into its variant (`"11823961": "escala ×2 · captions"`). Not a list of runs, not a count: the card already shows those.
 
 **Sweep or ablation summary.** One card when the whole sweep ends: the ranking in fields (`#1 lr=3e-4 bs=64` → `mAP 43.0`, five at most), the best configuration and how much it beats the default in the text, the metric-vs-hyperparameter plot as `image`, the full table as `.md`.
 
